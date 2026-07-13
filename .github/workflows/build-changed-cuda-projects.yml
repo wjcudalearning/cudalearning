@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   detect-projects:
+    name: Detect changed CUDA projects
     runs-on: ubuntu-latest
 
     outputs:
@@ -24,112 +25,118 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect changed CUDA project folders
+      - name: Detect changed project folders
         id: detect
-        shell: pwsh
+        shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
           CURRENT_SHA: ${{ github.sha }}
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          $root = "cuda_projects"
-          $workflowFile = ".github/workflows/build-changed-cuda-projects.yml"
+          ROOT="cuda_projects"
+          WORKFLOW_FILE=".github/workflows/build-changed-cuda-projects.yml"
+          PROJECT_LIST="$(mktemp)"
+          CHANGED_LIST="$(mktemp)"
 
-          function Get-AllCudaProjects {
-            if (-not (Test-Path $root)) {
-              return @()
-            }
+          cleanup() {
+            rm -f "$PROJECT_LIST" "$CHANGED_LIST"
+          }
+          trap cleanup EXIT
 
-            return @(
-              Get-ChildItem -Path $root -Directory |
-                Where-Object {
-                  @(Get-ChildItem -Path $_.FullName -Filter "*.cu" -File).Count -gt 0
-                } |
-                Select-Object -ExpandProperty Name
-            )
+          list_all_projects() {
+            if [[ ! -d "$ROOT" ]]; then
+              return 0
+            fi
+
+            find "$ROOT" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -print |
+            while IFS= read -r project_dir; do
+              if compgen -G "$project_dir/*.cu" > /dev/null; then
+                basename "$project_dir"
+              fi
+            done
           }
 
-          $projects = @()
+          add_changed_projects() {
+            while IFS= read -r changed_file; do
+              [[ -z "$changed_file" ]] && continue
 
-          if ($env:EVENT_NAME -eq "workflow_dispatch") {
-            Write-Host "Manual run: build all CUDA projects."
-            $projects = Get-AllCudaProjects
-          }
-          elseif (
-            [string]::IsNullOrWhiteSpace($env:BEFORE_SHA) -or
-            $env:BEFORE_SHA -match "^0+$"
-          ) {
-            Write-Host "Previous SHA is unavailable: build all CUDA projects."
-            $projects = Get-AllCudaProjects
-          }
-          else {
-            git cat-file -e "$($env:BEFORE_SHA)^{commit}" 2>$null
+              case "$changed_file" in
+                cuda_projects/*/*)
+                  project_name="${changed_file#cuda_projects/}"
+                  project_name="${project_name%%/*}"
+                  project_dir="$ROOT/$project_name"
 
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "Previous commit is unavailable: build all CUDA projects."
-              $projects = Get-AllCudaProjects
-            }
-            else {
-              $changedFiles = @(
-                git diff --name-only $env:BEFORE_SHA $env:CURRENT_SHA
-              )
-
-              Write-Host "Changed files:"
-              $changedFiles | ForEach-Object {
-                Write-Host " - $_"
-              }
-
-              if ($changedFiles -contains $workflowFile) {
-                Write-Host "Workflow changed: build all CUDA projects."
-                $projects = Get-AllCudaProjects
-              }
-              else {
-                foreach ($file in $changedFiles) {
-                  $normalized = $file -replace "\\", "/"
-
-                  if ($normalized -match "^cuda_projects/([^/]+)/") {
-                    $projectName = $Matches[1]
-                    $projectPath = Join-Path $root $projectName
-
-                    if (
-                      (Test-Path $projectPath) -and
-                      @(Get-ChildItem -Path $projectPath -Filter "*.cu" -File).Count -gt 0
-                    ) {
-                      $projects += $projectName
-                    }
-                  }
-                }
-              }
-            }
+                  if [[ -d "$project_dir" ]] &&
+                     compgen -G "$project_dir/*.cu" > /dev/null; then
+                    printf '%s\n' "$project_name"
+                  fi
+                  ;;
+              esac
+            done < "$CHANGED_LIST"
           }
 
-          $projects = @(
-            $projects |
-              Sort-Object -Unique
-          )
+          build_all=false
 
-          $json = [System.Text.Json.JsonSerializer]::Serialize(
-            [string[]]$projects
-          )
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Manual run: build all CUDA projects."
+            build_all=true
+          elif [[ -z "${BEFORE_SHA:-}" ]] ||
+               [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            echo "No usable previous SHA: build all CUDA projects."
+            build_all=true
+          elif ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            echo "Previous commit is unavailable: build all CUDA projects."
+            build_all=true
+          else
+            git diff \
+              --name-only \
+              "$BEFORE_SHA" \
+              "$CURRENT_SHA" > "$CHANGED_LIST"
 
-          $hasProjects = if ($projects.Count -gt 0) {
-            "true"
-          }
-          else {
-            "false"
-          }
+            echo "Changed files:"
+            sed 's/^/ - /' "$CHANGED_LIST"
 
-          "projects=$json" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            if grep -Fxq "$WORKFLOW_FILE" "$CHANGED_LIST"; then
+              echo "Workflow changed: build all CUDA projects."
+              build_all=true
+            fi
+          fi
 
-          "has_projects=$hasProjects" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if [[ "$build_all" == "true" ]]; then
+            list_all_projects > "$PROJECT_LIST"
+          else
+            add_changed_projects > "$PROJECT_LIST"
+          fi
 
-          Write-Host "Selected projects: $json"
+          sort -u "$PROJECT_LIST" -o "$PROJECT_LIST"
+
+          projects_json="$(
+            jq \
+              -R \
+              -s \
+              -c \
+              'split("\n") | map(select(length > 0))' \
+              < "$PROJECT_LIST"
+          )"
+
+          if [[ "$projects_json" == "[]" ]]; then
+            has_projects=false
+          else
+            has_projects=true
+          fi
+
+          echo "Selected projects: $projects_json"
+          echo "projects=$projects_json" >> "$GITHUB_OUTPUT"
+          echo "has_projects=$has_projects" >> "$GITHUB_OUTPUT"
 
   build-project:
+    name: Build ${{ matrix.project }}
     needs: detect-projects
     if: needs.detect-projects.outputs.has_projects == 'true'
 
@@ -138,7 +145,6 @@ jobs:
       matrix:
         project: ${{ fromJSON(needs.detect-projects.outputs.projects) }}
 
-    name: Build ${{ matrix.project }}
     runs-on: windows-2022
 
     steps:
@@ -208,7 +214,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           dumpbin /exports "build\${{ matrix.project }}\${{ matrix.project }}.dll"
 
-      - name: Package DLL and project interface files
+      - name: Package DLL and project files
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"

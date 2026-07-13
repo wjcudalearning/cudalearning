@@ -1,0 +1,6 @@
+build/
+package/
+*.dll
+*.lib
+*.exp
+__pycache__/

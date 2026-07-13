@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 #ifdef _WIN32
     #ifdef CUDA_DLL_EXPORTS
         #define CUDA_DLL_API extern "C" __declspec(dllexport)
@@ -57,6 +59,34 @@ struct CudaPatternMatchTiming {
     double estimated_vram_used_mib;
 };
 
+// Fixed-size crop origin. x/y may be negative; out-of-image pixels are filled
+// with fill_value so every crop keeps exactly crop_width x crop_height.
+struct CudaCropRoi {
+    int x;
+    int y;
+};
+
+// ctypes must use exactly the same field order.
+struct CudaCropTiming {
+    double host_prepare_ms;
+    double host_to_device_ms;
+    double kernel_ms;
+    double device_to_host_ms;
+    double total_ms;
+
+    long long output_pixel_count;
+    int roi_count;
+    int crop_width;
+    int crop_height;
+    int threads_per_block;
+    int kernel_launch_count;
+
+    double device_total_vram_mib;
+    double device_free_vram_before_mib;
+    double device_free_vram_after_alloc_mib;
+    double estimated_vram_used_mib;
+};
+
 // 正式版：金字塔 ZNCC。
 //
 // 流程：
@@ -89,6 +119,25 @@ CUDA_DLL_API int cuda_pattern_match_pyramid_zncc_u8(
     CudaPatternMatchResult* results,
     int* result_count,
     CudaPatternMatchTiming* timing
+);
+
+// 批量固定尺寸 ROI 擷取。輸入影像上傳一次，所有 ROI 在同一個 kernel
+// 中平行擷取，輸出排列為 [roi_count, crop_height, crop_width] 的連續 u8。
+// 超出影像範圍的部分使用 fill_value 補值。
+CUDA_DLL_API int cuda_crop_rois_u8(
+    const unsigned char* image,
+    int image_width,
+    int image_height,
+    int image_stride_bytes,
+    const CudaCropRoi* rois,
+    int roi_count,
+    int crop_width,
+    int crop_height,
+    unsigned char fill_value,
+    int block_threads,
+    unsigned char* output,
+    std::size_t output_capacity_bytes,
+    CudaCropTiming* timing
 );
 
 // 舊介面相容包裝。search_step 會被正規化為 1/2/4/8/16/32 的金字塔倍率。

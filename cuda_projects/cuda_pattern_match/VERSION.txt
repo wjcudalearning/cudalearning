@@ -1,3 +1,3 @@
-2.0.0-pyramid
+3.0.0-batch-crop
 
-GPU pyramid coarse-to-fine ZNCC formal version.
+Folder batch pattern matching, per-image/batch CSV export, and fixed-size CPU/GPU ROI crop export.

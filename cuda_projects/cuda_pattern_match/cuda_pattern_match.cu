@@ -21,6 +21,7 @@ constexpr int kFlatTemplate = -3;
 constexpr int kHostAllocationFailure = -4;
 constexpr int kNoCudaDevice = -5;
 constexpr int kDeviceAllocationTooLarge = -6;
+constexpr int kOutputBufferTooSmall = -7;
 
 constexpr int kMinCoarseTemplateDimension = 8;
 constexpr int kMaximumPyramidFactor = 32;
@@ -363,6 +364,53 @@ __global__ void select_refinement_kernel(
         source.y * 2 + best_offset_y,
         best_score,
     };
+}
+
+
+__global__ void crop_rois_u8_kernel(
+    const unsigned char* image,
+    int image_width,
+    int image_height,
+    const CudaCropRoi* rois,
+    int roi_count,
+    int crop_width,
+    int crop_height,
+    unsigned char fill_value,
+    long long pixel_offset,
+    long long pixel_count,
+    unsigned char* output
+) {
+    const long long local_index =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (local_index >= pixel_count) {
+        return;
+    }
+
+    const long long output_index = pixel_offset + local_index;
+    const long long pixels_per_crop =
+        static_cast<long long>(crop_width) * crop_height;
+    const int roi_index = static_cast<int>(output_index / pixels_per_crop);
+    if (roi_index >= roi_count) {
+        return;
+    }
+
+    const long long crop_pixel = output_index % pixels_per_crop;
+    const int local_x = static_cast<int>(crop_pixel % crop_width);
+    const int local_y = static_cast<int>(crop_pixel / crop_width);
+    const CudaCropRoi roi = rois[roi_index];
+    const int source_x = roi.x + local_x;
+    const int source_y = roi.y + local_y;
+
+    unsigned char value = fill_value;
+    if (
+        source_x >= 0 && source_x < image_width &&
+        source_y >= 0 && source_y < image_height
+    ) {
+        value = image[
+            static_cast<std::size_t>(source_y) * image_width + source_x
+        ];
+    }
+    output[output_index] = value;
 }
 
 float intersection_over_union(
@@ -1336,6 +1384,291 @@ int cuda_pattern_match_pyramid_zncc_u8(
     }
 }
 
+
+int cuda_crop_rois_u8(
+    const unsigned char* image,
+    int image_width,
+    int image_height,
+    int image_stride_bytes,
+    const CudaCropRoi* rois,
+    int roi_count,
+    int crop_width,
+    int crop_height,
+    unsigned char fill_value,
+    int block_threads,
+    unsigned char* output,
+    std::size_t output_capacity_bytes,
+    CudaCropTiming* timing
+) {
+    using Clock = std::chrono::steady_clock;
+    const auto total_start = Clock::now();
+    if (timing != nullptr) {
+        std::memset(timing, 0, sizeof(CudaCropTiming));
+    }
+
+    if (
+        image == nullptr || rois == nullptr || output == nullptr ||
+        image_width <= 0 || image_height <= 0 ||
+        image_stride_bytes < image_width || roi_count <= 0 ||
+        crop_width <= 0 || crop_height <= 0
+    ) {
+        return kInvalidArgument;
+    }
+
+    const auto prepare_start = Clock::now();
+    const std::size_t image_bytes =
+        static_cast<std::size_t>(image_width) * image_height;
+    const std::size_t roi_bytes =
+        static_cast<std::size_t>(roi_count) * sizeof(CudaCropRoi);
+
+    const long long pixels_per_crop =
+        static_cast<long long>(crop_width) * crop_height;
+    if (
+        pixels_per_crop <= 0 ||
+        pixels_per_crop > std::numeric_limits<long long>::max() / roi_count
+    ) {
+        return kDeviceAllocationTooLarge;
+    }
+    const long long output_pixels = pixels_per_crop * roi_count;
+    if (
+        static_cast<unsigned long long>(output_pixels) >
+        std::numeric_limits<std::size_t>::max()
+    ) {
+        return kDeviceAllocationTooLarge;
+    }
+    const std::size_t output_bytes = static_cast<std::size_t>(output_pixels);
+    if (output_capacity_bytes < output_bytes) {
+        return kOutputBufferTooSmall;
+    }
+
+    int device_count = 0;
+    cudaError_t error = cudaGetDeviceCount(&device_count);
+    if (error != cudaSuccess || device_count <= 0) {
+        return kNoCudaDevice;
+    }
+
+    cudaDeviceProp properties{};
+    error = cudaGetDeviceProperties(&properties, 0);
+    if (error != cudaSuccess) {
+        return cuda_status(error);
+    }
+    const int threads = normalize_block_threads(
+        block_threads,
+        properties.maxThreadsPerBlock
+    );
+    if (threads <= 0) {
+        return kInvalidArgument;
+    }
+
+    std::size_t free_before = 0;
+    std::size_t total_vram = 0;
+    error = cudaMemGetInfo(&free_before, &total_vram);
+    if (error != cudaSuccess) {
+        return cuda_status(error);
+    }
+
+    if (timing != nullptr) {
+        timing->host_prepare_ms =
+            std::chrono::duration<double, std::milli>(
+                Clock::now() - prepare_start
+            ).count();
+        timing->output_pixel_count = output_pixels;
+        timing->roi_count = roi_count;
+        timing->crop_width = crop_width;
+        timing->crop_height = crop_height;
+        timing->threads_per_block = threads;
+        timing->device_total_vram_mib =
+            static_cast<double>(total_vram) / (1024.0 * 1024.0);
+        timing->device_free_vram_before_mib =
+            static_cast<double>(free_before) / (1024.0 * 1024.0);
+    }
+
+    unsigned char* device_image = nullptr;
+    CudaCropRoi* device_rois = nullptr;
+    unsigned char* device_output = nullptr;
+    cudaEvent_t event_start = nullptr;
+    cudaEvent_t event_stop = nullptr;
+
+    auto finish = [&](int status) {
+        if (event_start != nullptr) {
+            cudaEventDestroy(event_start);
+        }
+        if (event_stop != nullptr) {
+            cudaEventDestroy(event_stop);
+        }
+        cudaFree(device_image);
+        cudaFree(device_rois);
+        cudaFree(device_output);
+        if (timing != nullptr) {
+            timing->total_ms =
+                std::chrono::duration<double, std::milli>(
+                    Clock::now() - total_start
+                ).count();
+        }
+        return status;
+    };
+
+    error = cudaEventCreate(&event_start);
+    if (error == cudaSuccess) {
+        error = cudaEventCreate(&event_stop);
+    }
+    if (error != cudaSuccess) {
+        return finish(cuda_status(error));
+    }
+
+    error = cudaMalloc(
+        reinterpret_cast<void**>(&device_image),
+        image_bytes
+    );
+    if (error == cudaSuccess) {
+        error = cudaMalloc(
+            reinterpret_cast<void**>(&device_rois),
+            roi_bytes
+        );
+    }
+    if (error == cudaSuccess) {
+        error = cudaMalloc(
+            reinterpret_cast<void**>(&device_output),
+            output_bytes
+        );
+    }
+    if (error != cudaSuccess) {
+        return finish(cuda_status(error));
+    }
+
+    std::size_t free_after_alloc = 0;
+    std::size_t total_after_alloc = 0;
+    error = cudaMemGetInfo(&free_after_alloc, &total_after_alloc);
+    if (error != cudaSuccess) {
+        return finish(cuda_status(error));
+    }
+    if (timing != nullptr) {
+        timing->device_free_vram_after_alloc_mib =
+            static_cast<double>(free_after_alloc) / (1024.0 * 1024.0);
+        timing->estimated_vram_used_mib =
+            static_cast<double>(image_bytes + roi_bytes + output_bytes) /
+            (1024.0 * 1024.0);
+    }
+
+    error = cudaEventRecord(event_start);
+    if (error == cudaSuccess) {
+        error = cudaMemcpy2D(
+            device_image,
+            static_cast<std::size_t>(image_width),
+            image,
+            static_cast<std::size_t>(image_stride_bytes),
+            static_cast<std::size_t>(image_width),
+            static_cast<std::size_t>(image_height),
+            cudaMemcpyHostToDevice
+        );
+    }
+    if (error == cudaSuccess) {
+        error = cudaMemcpy(
+            device_rois,
+            rois,
+            roi_bytes,
+            cudaMemcpyHostToDevice
+        );
+    }
+    if (error == cudaSuccess) {
+        error = cudaEventRecord(event_stop);
+    }
+    if (error == cudaSuccess) {
+        error = cudaEventSynchronize(event_stop);
+    }
+    if (error != cudaSuccess) {
+        return finish(cuda_status(error));
+    }
+    if (timing != nullptr) {
+        float elapsed = 0.0f;
+        cudaEventElapsedTime(&elapsed, event_start, event_stop);
+        timing->host_to_device_ms = elapsed;
+    }
+
+    error = cudaEventRecord(event_start);
+    if (error != cudaSuccess) {
+        return finish(cuda_status(error));
+    }
+
+    // Keep each grid within the device x-grid limit. In practice a single
+    // launch covers very large crop batches, but this also handles extreme
+    // output buffers without integer overflow.
+    const long long maximum_pixels_per_launch =
+        static_cast<long long>(properties.maxGridSize[0]) * threads;
+    int launch_count = 0;
+    for (
+        long long offset = 0;
+        offset < output_pixels;
+        offset += maximum_pixels_per_launch
+    ) {
+        const long long pixels_this_launch = std::min(
+            maximum_pixels_per_launch,
+            output_pixels - offset
+        );
+        const unsigned int blocks = static_cast<unsigned int>(
+            (pixels_this_launch + threads - 1) / threads
+        );
+        crop_rois_u8_kernel<<<blocks, threads>>>(
+            device_image,
+            image_width,
+            image_height,
+            device_rois,
+            roi_count,
+            crop_width,
+            crop_height,
+            fill_value,
+            offset,
+            pixels_this_launch,
+            device_output
+        );
+        error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            return finish(cuda_status(error));
+        }
+        ++launch_count;
+    }
+
+    error = cudaEventRecord(event_stop);
+    if (error == cudaSuccess) {
+        error = cudaEventSynchronize(event_stop);
+    }
+    if (error != cudaSuccess) {
+        return finish(cuda_status(error));
+    }
+    if (timing != nullptr) {
+        float elapsed = 0.0f;
+        cudaEventElapsedTime(&elapsed, event_start, event_stop);
+        timing->kernel_ms = elapsed;
+        timing->kernel_launch_count = launch_count;
+    }
+
+    error = cudaEventRecord(event_start);
+    if (error == cudaSuccess) {
+        error = cudaMemcpy(
+            output,
+            device_output,
+            output_bytes,
+            cudaMemcpyDeviceToHost
+        );
+    }
+    if (error == cudaSuccess) {
+        error = cudaEventRecord(event_stop);
+    }
+    if (error == cudaSuccess) {
+        error = cudaEventSynchronize(event_stop);
+    }
+    if (error != cudaSuccess) {
+        return finish(cuda_status(error));
+    }
+    if (timing != nullptr) {
+        float elapsed = 0.0f;
+        cudaEventElapsedTime(&elapsed, event_start, event_stop);
+        timing->device_to_host_ms = elapsed;
+    }
+
+    return finish(kSuccess);
+}
+
 int cuda_pattern_match_zncc_u8(
     const unsigned char* image,
     int image_width,
@@ -1395,6 +1728,8 @@ const char* cuda_pattern_match_error_string(int error_code) {
             return "No CUDA device is available";
         case kDeviceAllocationTooLarge:
             return "Requested CUDA grid or allocation is too large";
+        case kOutputBufferTooSmall:
+            return "Output buffer is too small";
         default:
             return cudaGetErrorString(static_cast<cudaError_t>(error_code));
     }

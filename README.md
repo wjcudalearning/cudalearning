@@ -1,69 +1,131 @@
-# GitHub Actions：將 CUDA `.cu` 編譯成 Windows `.dll`
+# CUDA 多子專案 GitHub Actions
 
-這是一個最小可執行範例：
-
-1. GitHub Actions 使用 `windows-2022` runner。
-2. 安裝 CUDA Toolkit 12.6.3。
-3. 使用 `nvcc` 將 `src/cuda_vector_add.cu` 編譯成 `cuda_vector_add.dll`。
-4. 使用 `dumpbin /exports` 驗證匯出函式。
-5. 將 DLL、標頭檔與 Python 測試檔上傳為 GitHub Actions artifact。
-6. 下載 artifact 到有 NVIDIA GPU 的 Windows 電腦，使用 Python `ctypes` 執行測試。
-
-## 專案結構
+固定根目錄：
 
 ```text
-.
-├─ .github/
-│  └─ workflows/
-│     └─ build-cuda-dll.yml
-├─ include/
-│  └─ cuda_vector_add.h
-├─ src/
-│  └─ cuda_vector_add.cu
-├─ python/
-│  └─ test_cuda_dll.py
-├─ .gitignore
-└─ README.md
+cuda_projects/
 ```
 
-## 在 GitHub 執行
-
-1. 建立一個 GitHub repository。
-2. 將此專案所有檔案上傳並 push。
-3. 進入 repository 的 **Actions** 頁面。
-4. 選擇 **Build CUDA DLL**。
-5. 按下 **Run workflow**。
-6. Workflow 成功後，在頁面下方下載：
-   `cuda-vector-add-windows-x64-sm86`
-
-## 在本機測試
-
-解壓縮 artifact，確認以下兩個檔案在同一資料夾：
+每個第一層子資料夾都是一個獨立 DLL 專案：
 
 ```text
-cuda_vector_add.dll
-test_cuda_dll.py
+cuda_projects/
+├─ cuda_vector_add/
+│  ├─ cuda_vector_add.cu
+│  ├─ cuda_vector_add.h
+│  └─ test.py
+└─ cuda_wic_image/
+   ├─ cuda_wic_image.cu
+   ├─ cuda_wic_image.h
+   └─ test.py
 ```
 
-執行：
+子資料夾名稱會直接成為 DLL 名稱：
+
+```text
+cuda_vector_add/ → cuda_vector_add.dll
+cuda_wic_image/  → cuda_wic_image.dll
+```
+
+## Push 時會發生什麼
+
+如果這次 push 只新增或修改：
+
+```text
+cuda_projects/cuda_wic_image/
+```
+
+Action 只會執行：
+
+```text
+Build cuda_wic_image
+```
+
+不會重新編譯其他子專案。
+
+如果同一次 push 修改三個子專案，就會建立三個 matrix jobs，
+分別編譯並上傳三個 artifacts。
+
+## 新增專案
+
+建立：
+
+```text
+cuda_projects/my_filter/
+```
+
+放入：
+
+```text
+cuda_projects/my_filter/my_filter.cu
+cuda_projects/my_filter/my_filter.h
+cuda_projects/my_filter/test.py
+```
+
+然後：
 
 ```powershell
-python test_cuda_dll.py
+git add cuda_projects/my_filter
+git commit -m "add my_filter CUDA project"
+git push
 ```
 
-預期輸出大致如下：
+編譯成功後，Actions 會產生：
 
 ```text
-偵測到 CUDA GPU 數量：1
-輸入 A： [1.0, 2.0, 3.0, 4.0]
-輸入 B： [10.0, 20.0, 30.0, 40.0]
-GPU 結果： [11.0, 22.0, 33.0, 44.0]
-測試成功：.cu → .dll → Python ctypes → CUDA kernel
+my_filter-windows-x64-sm86
 ```
 
-## 注意
+其中包含：
 
-- `-arch=sm_86` 是針對 RTX 3090/Ampere。
-- 一般 GitHub-hosted Windows runner 用來編譯，不保證有可用 NVIDIA GPU，因此 workflow 不直接執行 kernel。
-- DLL 採用 C ABI (`extern "C"`) 匯出，較容易從 Python、C#、C++ 呼叫。
-- `--cudart static` 可降低對額外 CUDA runtime DLL 的依賴；執行端仍需 NVIDIA 顯示卡驅動。
+```text
+my_filter.dll
+my_filter.lib
+my_filter.h
+test.py
+```
+
+## 手動執行
+
+在 GitHub：
+
+```text
+Actions
+→ Build Changed CUDA Projects
+→ Run workflow
+```
+
+手動執行會編譯 `cuda_projects/` 下的所有子專案。
+
+## 統一匯出巨集
+
+每個 `.h` 建議使用：
+
+```cpp
+#ifdef _WIN32
+    #ifdef CUDA_DLL_EXPORTS
+        #define CUDA_DLL_API extern "C" __declspec(dllexport)
+    #else
+        #define CUDA_DLL_API extern "C" __declspec(dllimport)
+    #endif
+#else
+    #define CUDA_DLL_API extern "C"
+#endif
+```
+
+workflow 已經自動加入：
+
+```text
+-DCUDA_DLL_EXPORTS
+```
+
+## 目前固定設定
+
+```text
+Windows runner: windows-2022
+CUDA Toolkit: 12.6.3
+GPU architecture: sm_86
+C++ standard: C++17
+```
+
+`sm_86` 適用 RTX 3090。

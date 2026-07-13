@@ -1,0 +1,253 @@
+name: Build Changed CUDA Projects
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "cuda_projects/**"
+      - ".github/workflows/build-changed-cuda-projects.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  detect-projects:
+    runs-on: ubuntu-latest
+
+    outputs:
+      projects: ${{ steps.detect.outputs.projects }}
+      has_projects: ${{ steps.detect.outputs.has_projects }}
+
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed CUDA project folders
+        id: detect
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = "cuda_projects"
+          $workflowFile = ".github/workflows/build-changed-cuda-projects.yml"
+
+          function Get-AllCudaProjects {
+            if (-not (Test-Path $root)) {
+              return @()
+            }
+
+            return @(
+              Get-ChildItem -Path $root -Directory |
+                Where-Object {
+                  @(Get-ChildItem -Path $_.FullName -Filter "*.cu" -File).Count -gt 0
+                } |
+                Select-Object -ExpandProperty Name
+            )
+          }
+
+          $projects = @()
+
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            Write-Host "Manual run: build all CUDA projects."
+            $projects = Get-AllCudaProjects
+          }
+          elseif (
+            [string]::IsNullOrWhiteSpace($env:BEFORE_SHA) -or
+            $env:BEFORE_SHA -match "^0+$"
+          ) {
+            Write-Host "Previous SHA is unavailable: build all CUDA projects."
+            $projects = Get-AllCudaProjects
+          }
+          else {
+            git cat-file -e "$($env:BEFORE_SHA)^{commit}" 2>$null
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "Previous commit is unavailable: build all CUDA projects."
+              $projects = Get-AllCudaProjects
+            }
+            else {
+              $changedFiles = @(
+                git diff --name-only $env:BEFORE_SHA $env:CURRENT_SHA
+              )
+
+              Write-Host "Changed files:"
+              $changedFiles | ForEach-Object {
+                Write-Host " - $_"
+              }
+
+              if ($changedFiles -contains $workflowFile) {
+                Write-Host "Workflow changed: build all CUDA projects."
+                $projects = Get-AllCudaProjects
+              }
+              else {
+                foreach ($file in $changedFiles) {
+                  $normalized = $file -replace "\\", "/"
+
+                  if ($normalized -match "^cuda_projects/([^/]+)/") {
+                    $projectName = $Matches[1]
+                    $projectPath = Join-Path $root $projectName
+
+                    if (
+                      (Test-Path $projectPath) -and
+                      @(Get-ChildItem -Path $projectPath -Filter "*.cu" -File).Count -gt 0
+                    ) {
+                      $projects += $projectName
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          $projects = @(
+            $projects |
+              Sort-Object -Unique
+          )
+
+          $json = [System.Text.Json.JsonSerializer]::Serialize(
+            [string[]]$projects
+          )
+
+          $hasProjects = if ($projects.Count -gt 0) {
+            "true"
+          }
+          else {
+            "false"
+          }
+
+          "projects=$json" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          "has_projects=$hasProjects" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          Write-Host "Selected projects: $json"
+
+  build-project:
+    needs: detect-projects
+    if: needs.detect-projects.outputs.has_projects == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(needs.detect-projects.outputs.projects) }}
+
+    name: Build ${{ matrix.project }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.6.3"
+          method: "network"
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Compile changed project into DLL
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+
+          setlocal EnableDelayedExpansion
+
+          set "PROJECT_NAME=${{ matrix.project }}"
+          set "PROJECT_DIR=cuda_projects\${{ matrix.project }}"
+          set "BUILD_DIR=build\${{ matrix.project }}"
+          set "DLL_PATH=build\${{ matrix.project }}\${{ matrix.project }}.dll"
+
+          if not exist "!PROJECT_DIR!" (
+            echo Missing project folder: !PROJECT_DIR!
+            exit /b 1
+          )
+
+          if not exist "!PROJECT_DIR!\*.cu" (
+            echo No .cu file found in: !PROJECT_DIR!
+            exit /b 1
+          )
+
+          if not exist "!BUILD_DIR!" mkdir "!BUILD_DIR!"
+
+          set "CU_FILES="
+          for %%F in ("!PROJECT_DIR!\*.cu") do (
+            set CU_FILES=!CU_FILES! "%%~fF"
+          )
+
+          echo Building project: !PROJECT_NAME!
+          echo CUDA sources: !CU_FILES!
+
+          nvcc --version
+
+          nvcc ^
+            -std=c++17 ^
+            -O2 ^
+            --shared ^
+            --cudart static ^
+            -arch=sm_86 ^
+            -Xcompiler "/MD /EHsc" ^
+            -DCUDA_DLL_EXPORTS ^
+            -I"!PROJECT_DIR!" ^
+            !CU_FILES! ^
+            -o "!DLL_PATH!"
+
+          if errorlevel 1 exit /b !errorlevel!
+
+          dir "!BUILD_DIR!"
+
+      - name: Verify DLL exports
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          dumpbin /exports "build\${{ matrix.project }}\${{ matrix.project }}.dll"
+
+      - name: Package DLL and project interface files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $project = "${{ matrix.project }}"
+          $projectPath = Join-Path "cuda_projects" $project
+          $buildPath = Join-Path "build" $project
+          $packagePath = Join-Path "package" $project
+
+          New-Item -ItemType Directory -Force -Path $packagePath |
+            Out-Null
+
+          Copy-Item `
+            (Join-Path $buildPath "$project.dll") `
+            $packagePath
+
+          foreach ($extension in @(".lib", ".exp")) {
+            $compiledFile = Join-Path $buildPath "$project$extension"
+
+            if (Test-Path $compiledFile) {
+              Copy-Item $compiledFile $packagePath
+            }
+          }
+
+          Get-ChildItem -Path $projectPath -File |
+            Where-Object {
+              $_.Extension -in @(".h", ".hpp", ".py")
+            } |
+            Copy-Item -Destination $packagePath
+
+          Get-ChildItem -Path $packagePath |
+            ForEach-Object {
+              Write-Host "Packaged: $($_.Name)"
+            }
+
+      - name: Upload project artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.project }}-windows-x64-sm86
+          path: package/${{ matrix.project }}/
+          retention-days: 14
+          if-no-files-found: error

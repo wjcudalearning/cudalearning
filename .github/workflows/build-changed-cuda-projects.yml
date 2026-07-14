@@ -251,7 +251,7 @@ jobs:
             }
 
       - name: Upload project artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.project }}-windows-x64-sm86
           path: package/${{ matrix.project }}/

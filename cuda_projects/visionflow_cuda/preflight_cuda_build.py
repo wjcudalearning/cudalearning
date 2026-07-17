@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+
 REQUIRED_ABI_V1_EXPORTS = {
     "vf_adaptive_mean_u8",
     "vf_bgr_to_gray_u8",
@@ -27,6 +28,7 @@ REQUIRED_ABI_V1_EXPORTS = {
     "vf_resize_gray_u8",
     "vf_threshold_u8",
 }
+
 REQUIRED_SMOKE_EXPORTS = {
     "vf_bgr_to_gray_u8",
     "vf_context_create",
@@ -39,14 +41,29 @@ REQUIRED_SMOKE_EXPORTS = {
     "vf_gpu_error_message",
     "vf_preprocess_401_2_u8",
 }
-CONTRACT_FILES = {
-    "manifest": Path("cuda_project.json"),
-    "header": Path("include/visionflow_cuda.h"),
-    "errors": Path("include/visionflow_cuda_errors.h"),
-    "internal": Path("include/visionflow_cuda_internal.cuh"),
-    "source": Path("visionflow_cuda.cu"),
-    "smoke": Path("test_cuda_api.cu"),
-    "build": Path("build_cuda_dll.ps1"),
+
+# Headers may be kept in include/ (preferred) or directly in the project root.
+# Supporting both layouts makes the project robust when files were uploaded through
+# the GitHub web UI and the directory hierarchy was accidentally flattened.
+FILE_CANDIDATES = {
+    "header": (Path("include/visionflow_cuda.h"), Path("visionflow_cuda.h")),
+    "errors": (Path("include/visionflow_cuda_errors.h"), Path("visionflow_cuda_errors.h")),
+    "internal": (
+        Path("include/visionflow_cuda_internal.cuh"),
+        Path("visionflow_cuda_internal.cuh"),
+    ),
+    "source": (Path("visionflow_cuda.cu"),),
+    "smoke": (Path("test_cuda_api.cu"),),
+    "build": (Path("build_cuda_dll.ps1"),),
+}
+
+DEFAULT_MANIFEST = {
+    "schema_version": 1,
+    "project_name": "visionflow_cuda",
+    "architecture": "sm_86",
+    "dll_sources": ["visionflow_cuda.cu"],
+    "smoke_sources": ["test_cuda_api.cu"],
+    "output_dll": "visionflow_cuda.dll",
 }
 
 
@@ -54,17 +71,64 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def inspect_contract(root: Path = ROOT) -> dict:
-    paths = {name: root / relative for name, relative in CONTRACT_FILES.items()}
-    missing_files = [str(path) for path in paths.values() if not path.is_file()]
-    if missing_files:
-        raise AssertionError(f"Missing CUDA contract files: {missing_files}")
+def _relative(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
 
-    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+
+def _nearby_names(root: Path, expected_name: str) -> list[str]:
+    stem = Path(expected_name).stem.split(".")[0]
+    candidates = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and (stem in path.stem or expected_name.lower() == path.name.lower())
+    }
+    return sorted(candidates)
+
+
+def _resolve_file(root: Path, label: str, candidates: tuple[Path, ...]) -> Path:
+    existing = [root / relative for relative in candidates if (root / relative).is_file()]
+    if not existing:
+        expected = " or ".join(relative.as_posix() for relative in candidates)
+        nearby = _nearby_names(root, candidates[-1].name)
+        hint = f" Similar files found: {nearby}." if nearby else ""
+        raise AssertionError(f"Missing {label}: expected {expected}.{hint}")
+
+    # A stale root-level copy can silently shadow include/. Fail early when duplicate
+    # files differ; identical duplicates are accepted but include/ remains preferred.
+    if len(existing) > 1:
+        hashes = {_sha256(path) for path in existing}
+        if len(hashes) != 1:
+            names = [_relative(path, root) for path in existing]
+            raise AssertionError(
+                f"Conflicting duplicate {label} files: {names}. "
+                "Delete the stale copy or make the files identical."
+            )
+
+    return existing[0]
+
+
+def _load_manifest(root: Path) -> tuple[dict, Path | None]:
+    manifest_path = root / "cuda_project.json"
+    if not manifest_path.is_file():
+        return dict(DEFAULT_MANIFEST), None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"Invalid cuda_project.json: {exc}") from exc
+    return manifest, manifest_path
+
+
+def inspect_contract(root: Path = ROOT) -> dict:
+    root = root.resolve()
+    paths = {
+        label: _resolve_file(root, label, candidates)
+        for label, candidates in FILE_CANDIDATES.items()
+    }
+    manifest, manifest_path = _load_manifest(root)
+
     texts = {
         name: path.read_text(encoding="utf-8")
         for name, path in paths.items()
-        if name != "manifest"
     }
 
     header_exports = set(
@@ -75,51 +139,104 @@ def inspect_contract(root: Path = ROOT) -> dict:
     )
     abi_match = re.search(r"#define\s+VF_CUDA_ABI_VERSION\s+(\d+)", texts["header"])
     if abi_match is None:
-        raise AssertionError("VF_CUDA_ABI_VERSION is missing from the public header")
+        raise AssertionError("VF_CUDA_ABI_VERSION is missing from visionflow_cuda.h")
 
     errors: list[str] = []
-    if manifest.get("project_name") != "visionflow_cuda":
-        errors.append("cuda_project.json project_name must be visionflow_cuda")
-    if manifest.get("dll_sources") != ["visionflow_cuda.cu"]:
-        errors.append("DLL source manifest must contain only visionflow_cuda.cu")
-    if manifest.get("smoke_sources") != ["test_cuda_api.cu"]:
-        errors.append("smoke source manifest must contain only test_cuda_api.cu")
+
+    expected_manifest = DEFAULT_MANIFEST
+    for key in ("schema_version", "project_name", "dll_sources", "smoke_sources", "output_dll"):
+        if manifest.get(key) != expected_manifest[key]:
+            errors.append(
+                f"cuda_project.json {key} must be {expected_manifest[key]!r}; "
+                f"got {manifest.get(key)!r}"
+            )
+
     if header_exports != source_exports:
         errors.append(
             "header/source exports differ: "
             f"missing_definitions={sorted(header_exports - source_exports)}, "
             f"undeclared_definitions={sorted(source_exports - header_exports)}"
         )
+
     missing_required = REQUIRED_ABI_V1_EXPORTS - header_exports
     if missing_required:
         errors.append(f"required ABI v1 exports missing: {sorted(missing_required)}")
-    missing_smoke = {name for name in REQUIRED_SMOKE_EXPORTS if name not in texts["smoke"]}
+
+    missing_smoke = {
+        name for name in REQUIRED_SMOKE_EXPORTS if name not in texts["smoke"]
+    }
     if missing_smoke:
         errors.append(f"native smoke does not call required exports: {sorted(missing_smoke)}")
+
+    required_includes = {
+        "source": ("visionflow_cuda.h", "visionflow_cuda_internal.cuh"),
+        "header": ("visionflow_cuda_errors.h",),
+        "internal": ("visionflow_cuda_errors.h", "cuda_runtime.h"),
+        "smoke": ("visionflow_cuda.h",),
+    }
+    for text_name, include_names in required_includes.items():
+        for include_name in include_names:
+            pattern = rf'#include\s*[<"]{re.escape(include_name)}[>"]'
+            if not re.search(pattern, texts[text_name]):
+                errors.append(f"{paths[text_name].name} must include {include_name}")
+
     if "visionflow_cuda.cu" not in texts["build"] or "test_cuda_api.cu" not in texts["build"]:
-        errors.append("build script is missing the explicit DLL or smoke source")
+        errors.append("build script must explicitly name the DLL and smoke sources")
     if re.search(r"(?:\*\.cu|Get-ChildItem[^\n]*\.cu)", texts["build"], re.IGNORECASE):
         errors.append("build script must not compile CUDA sources through a wildcard/glob")
+
     if errors:
         raise AssertionError("CUDA build preflight failed:\n- " + "\n- ".join(errors))
 
+    include_dirs: list[str] = []
+    for key in ("header", "errors", "internal"):
+        parent = paths[key].parent
+        relative_parent = _relative(parent, root) if parent != root else "."
+        if relative_parent not in include_dirs:
+            include_dirs.append(relative_parent)
+    if "." not in include_dirs:
+        include_dirs.append(".")
+
+    hashed_paths = dict(paths)
+    if manifest_path is not None:
+        hashed_paths["manifest"] = manifest_path
+
     return {
         "schema_version": 1,
-        "project_name": manifest["project_name"],
+        "project_name": "visionflow_cuda",
         "abi_version": int(abi_match.group(1)),
         "architecture": manifest.get("architecture", "sm_86"),
         "exports": sorted(header_exports),
-        "dll_sources": manifest["dll_sources"],
-        "smoke_sources": manifest["smoke_sources"],
-        "sha256": {name: _sha256(path) for name, path in paths.items()},
+        "dll_sources": ["visionflow_cuda.cu"],
+        "smoke_sources": ["test_cuda_api.cu"],
+        "output_dll": "visionflow_cuda.dll",
+        "include_dirs": include_dirs,
+        "resolved_files": {
+            name: _relative(path, root) for name, path in paths.items()
+        },
+        "manifest_source": (
+            _relative(manifest_path, root) if manifest_path is not None else "built-in defaults"
+        ),
+        "sha256": {
+            name: _sha256(path) for name, path in sorted(hashed_paths.items())
+        },
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Statically validate this standalone CUDA DLL project.")
+    parser = argparse.ArgumentParser(
+        description="Statically validate the standalone VisionFlow CUDA DLL project."
+    )
     parser.add_argument("--output", type=Path, help="Optional JSON manifest output path.")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=ROOT,
+        help="Project root. Defaults to the directory containing this script.",
+    )
     args = parser.parse_args()
-    result = inspect_contract()
+
+    result = inspect_contract(args.root)
     rendered = json.dumps(result, indent=2)
     print(rendered)
     if args.output:

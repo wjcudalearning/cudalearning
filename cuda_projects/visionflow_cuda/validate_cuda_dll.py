@@ -1,812 +1,350 @@
-#define VISIONFLOW_CUDA_EXPORTS
-#include "visionflow_cuda.h"
-#include "visionflow_cuda_internal.cuh"
-#include <algorithm>
-#include <climits>
-#include <cmath>
-#include <cstring>
-#include <new>
-#include <vector>
+from __future__ import annotations
 
-namespace {
-constexpr int BLOCK_X = 16;
-constexpr int BLOCK_Y = 16;
-constexpr int SCAN_THREADS = 256;
-constexpr int TRANSPOSE_TILE = 32;
-constexpr int TRANSPOSE_ROWS = 8;
-constexpr int MAX_GAUSSIAN_KERNEL = 127;
+import argparse
+import json
+import sys
+import tempfile
+import time
+from copy import deepcopy
+from pathlib import Path
 
-__constant__ float gaussian_weights[MAX_GAUSSIAN_KERNEL];
+import cv2
+import numpy as np
+import yaml
 
-struct PersistentContext {
-    uint8_t* u8[4]{};
-    size_t u8_capacity[4]{};
-    float* float_buffer = nullptr;
-    size_t float_capacity = 0;
-    unsigned long long* u64[2]{};
-    size_t u64_capacity[2]{};
-    unsigned long long allocation_count = 0;
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-    ~PersistentContext() {
-        for (void* pointer : u8) visionflow_cuda::free_device(pointer);
-        visionflow_cuda::free_device(float_buffer);
-        for (void* pointer : u64) visionflow_cuda::free_device(pointer);
+from core.gpu_runtime import GpuRuntime  # noqa: E402
+from core.pipeline import AOIPipeline  # noqa: E402
+from core.recipe_manager import RecipeManager  # noqa: E402
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate visionflow_cuda.dll against the CPU AOI path.")
+    parser.add_argument("--dll", default="gpu/visionflow_cuda.dll", help="CUDA DLL path.")
+    parser.add_argument("--image", help="Optional real image for full CPU/GPU pipeline comparison.")
+    parser.add_argument("--recipe", help="Recipe used with --image.")
+    parser.add_argument("--benchmark", type=int, default=20, help="Primitive benchmark repetitions.")
+    args = parser.parse_args()
+    if bool(args.image) != bool(args.recipe):
+        parser.error("--image and --recipe must be provided together")
+    return args
+
+
+def compare(name: str, actual: np.ndarray, expected: np.ndarray, max_diff: int = 0, mismatch_ratio: float = 0.0) -> dict:
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        raise AssertionError(
+            f"{name}: shape/dtype mismatch actual={actual.shape}/{actual.dtype}, expected={expected.shape}/{expected.dtype}"
+        )
+    delta = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+    observed_max = int(delta.max(initial=0))
+    observed_ratio = float(np.count_nonzero(delta) / max(delta.size, 1))
+    out_of_tolerance_ratio = float(np.count_nonzero(delta > max_diff) / max(delta.size, 1))
+    if out_of_tolerance_ratio > mismatch_ratio:
+        raise AssertionError(
+            f"{name}: max_diff={observed_max} (limit {max_diff}), mismatch_ratio={observed_ratio:.6f} "
+            f"out_of_tolerance_ratio={out_of_tolerance_ratio:.6f} (limit {mismatch_ratio:.6f})"
+        )
+    result = {
+        "name": name,
+        "max_diff": observed_max,
+        "mean_diff": round(float(delta.mean()), 6),
+        "mismatch_ratio": round(observed_ratio, 6),
+        "out_of_tolerance_ratio": round(out_of_tolerance_ratio, 6),
     }
-};
+    print(f"PASS {name}: {result}")
+    return result
 
-template <typename T>
-int reserve_device(
-    T** pointer,
-    size_t* capacity,
-    size_t count,
-    unsigned long long* allocation_count = nullptr) {
-    if (pointer == nullptr || capacity == nullptr || count == 0 || count > SIZE_MAX / sizeof(T)) {
-        return VF_CUDA_INVALID_ARGUMENT;
+
+def validate_primitives(runtime: GpuRuntime) -> list[dict]:
+    rng = np.random.default_rng(20260714)
+    bgr = rng.integers(0, 256, size=(128, 192, 3), dtype=np.uint8)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)[1]
+    metrics = []
+    metrics.append(compare("bgr_to_rgb", runtime.bgr_to_rgb(bgr), cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+    metrics.append(compare("bgr_to_gray", runtime.bgr_to_gray(bgr), gray, max_diff=1))
+    metrics.append(compare("crop_bgr", runtime.crop(bgr, 17, 13, 91, 67), bgr[13:80, 17:108]))
+    metrics.append(
+        compare(
+            "resize_gray",
+            runtime.resize_gray(gray, 96, 64),
+            cv2.resize(gray, (96, 64), interpolation=cv2.INTER_AREA),
+            max_diff=1,
+            mismatch_ratio=0.001,
+        )
+    )
+    metrics.append(
+        compare(
+            "gaussian_blur_gray",
+            runtime.gaussian_blur(gray, 5),
+            cv2.GaussianBlur(gray, (5, 5), 0),
+            max_diff=2,
+            mismatch_ratio=0.001,
+        )
+    )
+    metrics.append(compare("global_threshold", runtime.threshold(gray, 128, 255, False), binary))
+    structured_gray = {
+        "random_odd": rng.integers(0, 256, size=(65, 97), dtype=np.uint8),
+        "black": np.zeros((63, 79), dtype=np.uint8),
+        "white": np.full((63, 79), 255, dtype=np.uint8),
+        "checker": ((np.indices((63, 79)).sum(axis=0) % 2) * 255).astype(np.uint8),
+        "non_contiguous": gray[:, ::2],
     }
-    if (*pointer != nullptr && *capacity >= count) return VF_CUDA_OK;
-    T* replacement = nullptr;
-    cudaError_t error = cudaMalloc(&replacement, count * sizeof(T));
-    if (error != cudaSuccess) return visionflow_cuda::runtime_error(error);
-    visionflow_cuda::free_device(*pointer);
-    *pointer = replacement;
-    *capacity = count;
-    if (allocation_count != nullptr) ++(*allocation_count);
-    return VF_CUDA_OK;
-}
+    for case_name, case in structured_gray.items():
+        for kernel_size in (3, 5, 15, 25, 45):
+            expected_gaussian = cv2.GaussianBlur(case, (kernel_size, kernel_size), 0)
+            metrics.append(
+                compare(
+                    f"gaussian_{case_name}_k{kernel_size}",
+                    runtime.gaussian_blur(case, kernel_size),
+                    expected_gaussian,
+                    max_diff=2,
+                    mismatch_ratio=0.001,
+                )
+            )
+    expected_gaussian_bgr = cv2.GaussianBlur(bgr, (15, 15), 0)
+    metrics.append(
+        compare(
+            "gaussian_bgr_k15",
+            runtime.gaussian_blur(bgr, 15),
+            expected_gaussian_bgr,
+            max_diff=2,
+            mismatch_ratio=0.001,
+        )
+    )
+    adaptive_cases = (
+        ("random_binary_b3_c2", structured_gray["random_odd"], 3, 2.0, False),
+        ("random_binary_b11_cneg2", structured_gray["random_odd"], 11, -2.0, False),
+        ("random_inverse_b35_c24", structured_gray["random_odd"], 35, 2.4, True),
+        ("black_binary_b11", structured_gray["black"], 11, 2.0, False),
+        ("white_inverse_b11", structured_gray["white"], 11, 2.0, True),
+        ("checker_binary_b35", structured_gray["checker"], 35, -2.0, False),
+        ("non_contiguous_inverse_b11", structured_gray["non_contiguous"], 11, -2.0, True),
+    )
+    for case_name, case, block_size, adaptive_c, invert in adaptive_cases:
+        threshold_type = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+        expected_adaptive = cv2.adaptiveThreshold(
+            case,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            threshold_type,
+            block_size,
+            adaptive_c,
+        )
+        metrics.append(
+            compare(
+                f"adaptive_{case_name}",
+                runtime.adaptive_threshold(case, block_size, adaptive_c, 255, invert),
+                expected_adaptive,
+                max_diff=0,
+                mismatch_ratio=0.02,
+            )
+        )
+    if runtime.supports_fused_401_2:
+        fused_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        fused_expected = cv2.adaptiveThreshold(
+            cv2.GaussianBlur(fused_gray, (25, 25), 0),
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            35,
+            -2.0,
+        )
+        metrics.append(
+            compare(
+                "fused_401_2_bgr",
+                runtime.preprocess_401_2(bgr, 25, 35, -2.0, 255, True),
+                fused_expected,
+                max_diff=0,
+                mismatch_ratio=0.02,
+            )
+        )
+        first_context_stats = runtime.performance_stats()["persistent_context"]
+        repeated = runtime.preprocess_401_2(bgr, 25, 35, -2.0, 255, True)
+        metrics.append(
+            compare(
+                "fused_401_2_bgr_reused_context",
+                repeated,
+                fused_expected,
+                max_diff=0,
+                mismatch_ratio=0.02,
+            )
+        )
+        second_context_stats = runtime.performance_stats()["persistent_context"]
+        if first_context_stats.get("allocation_count") != second_context_stats.get("allocation_count"):
+            raise AssertionError(
+                "fused_401_2 context allocated again for an unchanged image shape: "
+                f"first={first_context_stats}, second={second_context_stats}"
+            )
+        print(f"PASS fused_401_2 persistent context reuse: {second_context_stats}")
+    else:
+        print(f"SKIP fused_401_2_bgr: {runtime.fused_unavailable_reason}")
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    for operation, cv_operation in (
+        ("open", cv2.MORPH_OPEN),
+        ("close", cv2.MORPH_CLOSE),
+        ("dilate", cv2.MORPH_DILATE),
+        ("erode", cv2.MORPH_ERODE),
+    ):
+        expected = (
+            cv2.morphologyEx(binary, cv_operation, kernel, iterations=1)
+            if operation in {"open", "close"}
+            else cv2.dilate(binary, kernel, iterations=1)
+            if operation == "dilate"
+            else cv2.erode(binary, kernel, iterations=1)
+        )
+        metrics.append(compare(f"morphology_{operation}", runtime.morphology(binary, operation, 3, 1), expected))
+    return metrics
 
-int prepare_gaussian_weights(int kernel, int* radius_out) {
-    if (radius_out == nullptr || kernel < 3 || kernel % 2 == 0 || kernel > MAX_GAUSSIAN_KERNEL) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    double sigma = 0.3 * ((kernel - 1) * 0.5 - 1) + 0.8;
-    std::vector<float> weights(kernel);
-    float total = 0.0f;
-    int radius = kernel / 2;
-    for (int i = -radius; i <= radius; ++i) {
-        weights[i + radius] = expf(-(i * i) / static_cast<float>(2.0 * sigma * sigma));
-        total += weights[i + radius];
-    }
-    for (float& value : weights) value /= total;
-    cudaError_t error = cudaMemcpyToSymbol(
-        gaussian_weights, weights.data(), static_cast<size_t>(kernel) * sizeof(float));
-    if (error != cudaSuccess) return visionflow_cuda::runtime_error(error);
-    *radius_out = radius;
-    return VF_CUDA_OK;
-}
 
-int adaptive_layout(
-    int width,
-    int height,
-    int block,
-    int* radius_out,
-    int* padded_width_out,
-    int* padded_height_out,
-    size_t* padded_count_out) {
-    if (width <= 0 || height <= 0 || block < 3 || block % 2 == 0 || radius_out == nullptr ||
-        padded_width_out == nullptr || padded_height_out == nullptr || padded_count_out == nullptr) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    int radius = block / 2;
-    if (radius > (INT_MAX - width) / 2 || radius > (INT_MAX - height) / 2) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    int padded_width = width + radius * 2;
-    int padded_height = height + radius * 2;
-    if (static_cast<size_t>(padded_width) > SIZE_MAX / static_cast<size_t>(padded_height)) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    size_t padded_count = static_cast<size_t>(padded_width) * static_cast<size_t>(padded_height);
-    if (padded_count > SIZE_MAX / sizeof(unsigned long long)) return VF_CUDA_INVALID_ARGUMENT;
-    *radius_out = radius;
-    *padded_width_out = padded_width;
-    *padded_height_out = padded_height;
-    *padded_count_out = padded_count;
-    return VF_CUDA_OK;
-}
+def _average_ms(operation, repetitions: int) -> float:
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        operation()
+    return (time.perf_counter() - started) * 1000.0 / repetitions
 
-int cuda_result(cudaError_t error) { return visionflow_cuda::runtime_error(error); }
 
-int alloc_copy(const uint8_t* host, int width, int height, int stride, int channels, uint8_t** device) {
-    return visionflow_cuda::allocate_and_upload(host, width, height, stride, channels, device);
-}
-
-int copy_back_free(uint8_t* host, int stride, int width, int height, int channels, uint8_t* device) {
-    return visionflow_cuda::download_and_free(host, stride, width, height, channels, device);
-}
-
-__device__ int reflect101(int value, int length) {
-    if (length <= 1) return 0;
-    while (value < 0 || value >= length) {
-        value = value < 0 ? -value : 2 * length - value - 2;
-    }
-    return value;
-}
-
-__global__ void bgr_gray_kernel(const uint8_t* src, uint8_t* dst, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    int index = (y * width + x) * 3;
-    dst[y * width + x] = static_cast<uint8_t>((29 * src[index] + 150 * src[index + 1] + 77 * src[index + 2] + 128) >> 8);
-}
-
-__global__ void bgr_rgb_kernel(const uint8_t* src, uint8_t* dst, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    int i = (y * width + x) * 3;
-    dst[i] = src[i + 2]; dst[i + 1] = src[i + 1]; dst[i + 2] = src[i];
-}
-
-__global__ void crop_kernel(const uint8_t* src, uint8_t* dst, int src_width, int x0, int y0, int width, int height, int channels) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    for (int c = 0; c < channels; ++c) dst[(y * width + x) * channels + c] = src[((y + y0) * src_width + x + x0) * channels + c];
-}
-
-__global__ void resize_gray_kernel(const uint8_t* src, uint8_t* dst, int sw, int sh, int dw, int dh) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= dw || y >= dh) return;
-    if (dw <= sw && dh <= sh) {
-        float scale_x = static_cast<float>(sw) / dw;
-        float scale_y = static_cast<float>(sh) / dh;
-        float source_x0 = x * scale_x;
-        float source_x1 = (x + 1) * scale_x;
-        float source_y0 = y * scale_y;
-        float source_y1 = (y + 1) * scale_y;
-        int start_x = static_cast<int>(floorf(source_x0));
-        int end_x = static_cast<int>(ceilf(source_x1));
-        int start_y = static_cast<int>(floorf(source_y0));
-        int end_y = static_cast<int>(ceilf(source_y1));
-        float sum = 0.0f;
-        for (int source_y = start_y; source_y < end_y; ++source_y) {
-            float weight_y = fmaxf(0.0f, fminf(source_y1, source_y + 1.0f) - fmaxf(source_y0, static_cast<float>(source_y)));
-            int clamped_y = max(0, min(sh - 1, source_y));
-            for (int source_x = start_x; source_x < end_x; ++source_x) {
-                float weight_x = fmaxf(0.0f, fminf(source_x1, source_x + 1.0f) - fmaxf(source_x0, static_cast<float>(source_x)));
-                int clamped_x = max(0, min(sw - 1, source_x));
-                sum += src[clamped_y * sw + clamped_x] * weight_x * weight_y;
+def benchmark(runtime: GpuRuntime, repetitions: int) -> dict:
+    if repetitions <= 0:
+        return {}
+    image = np.random.default_rng(7).integers(0, 256, size=(2160, 3840, 3), dtype=np.uint8)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    runtime.bgr_to_gray(image)
+    runtime.gaussian_blur(gray, 45)
+    runtime.adaptive_threshold(gray, 35, -2.0, 255, False)
+    operations = (
+        ("bgr_to_gray_4k", lambda: cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), lambda: runtime.bgr_to_gray(image)),
+        ("gaussian_gray_4k_k45", lambda: cv2.GaussianBlur(gray, (45, 45), 0), lambda: runtime.gaussian_blur(gray, 45)),
+        (
+            "adaptive_mean_gray_4k_b35",
+            lambda: cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 35, -2.0),
+            lambda: runtime.adaptive_threshold(gray, 35, -2.0, 255, False),
+        ),
+    )
+    if runtime.supports_fused_401_2:
+        operations += (
+            (
+                "fused_401_2_bgr_4k",
+                lambda: cv2.adaptiveThreshold(
+                    cv2.GaussianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (25, 25), 0),
+                    255,
+                    cv2.ADAPTIVE_THRESH_MEAN_C,
+                    cv2.THRESH_BINARY_INV,
+                    35,
+                    -2.0,
+                ),
+                lambda: runtime.preprocess_401_2(image, 25, 35, -2.0, 255, True),
+            ),
+        )
+    measurements = []
+    for name, cpu_operation, gpu_operation in operations:
+        cpu_ms = _average_ms(cpu_operation, repetitions)
+        gpu_ms = _average_ms(gpu_operation, repetitions)
+        measurements.append(
+            {
+                "operation": name,
+                "cpu_average_ms": round(cpu_ms, 3),
+                "gpu_average_ms_including_transfer": round(gpu_ms, 3),
+                "speedup": round(cpu_ms / gpu_ms, 3) if gpu_ms > 0 else None,
             }
+        )
+    result = {
+        "repetitions": repetitions,
+        "image_shape": list(image.shape),
+        "measurements": measurements,
+        "gpu_host_metrics": runtime.performance_stats(),
+    }
+    print(f"BENCHMARK {result}")
+    return result
+
+
+def normalized_result(result: dict) -> dict:
+    normalized = deepcopy(result)
+    for key in ("duration_sec", "outputs", "execution"):
+        normalized.pop(key, None)
+    for tile_result in normalized.get("tiles", []):
+        for detector_result in tile_result.get("detectors", []):
+            detector_result.pop("execution", None)
+    return normalized
+
+
+def validate_pipeline(image_path: Path, recipe_path: Path, dll_path: str) -> None:
+    manager = RecipeManager()
+    base = manager.load(recipe_path)
+    cpu_recipe = deepcopy(base)
+    gpu_recipe = deepcopy(base)
+    cpu_recipe["gpu"] = {
+        "tiling": False,
+        "display": False,
+        "dll_path": dll_path,
+        "fallback_to_cpu": False,
+    }
+    gpu_recipe["gpu"] = {
+        "tiling": True,
+        "display": True,
+        "dll_path": dll_path,
+        "fallback_to_cpu": False,
+    }
+    for config in cpu_recipe.get("detectors", {}).values():
+        config["use_gpu"] = False
+    for config in gpu_recipe.get("detectors", {}).values():
+        config["use_gpu"] = bool(config.get("enabled", False))
+    for recipe in (cpu_recipe, gpu_recipe):
+        recipe["output"] = {key: False for key in recipe.get("output", {})}
+
+    with tempfile.TemporaryDirectory(prefix="visionflow_cuda_validation_") as temporary:
+        temporary_path = Path(temporary)
+        cpu_path = temporary_path / "cpu.yaml"
+        gpu_path = temporary_path / "gpu.yaml"
+        cpu_path.write_text(yaml.safe_dump(cpu_recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        gpu_path.write_text(yaml.safe_dump(gpu_recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        cpu_result = AOIPipeline(cpu_path, temporary_path / "cpu_outputs").run(image_path)
+        gpu_result = AOIPipeline(gpu_path, temporary_path / "gpu_outputs").run(image_path)
+
+    active = gpu_result.get("execution", {}).get("gpu", {})
+    if not active.get("tiling", {}).get("active"):
+        raise AssertionError(f"GPU tiling did not activate: {active}")
+    inactive_detectors = {
+        detector_id: status
+        for detector_id, status in active.get("detectors", {}).items()
+        if status.get("requested") and not status.get("active")
+    }
+    if inactive_detectors:
+        raise AssertionError(f"GPU detectors did not activate: {inactive_detectors}")
+
+    cpu_normalized = normalized_result(cpu_result)
+    gpu_normalized = normalized_result(gpu_result)
+    if cpu_normalized != gpu_normalized:
+        summary = {
+            "cpu_final": cpu_result.get("final_result"),
+            "gpu_final": gpu_result.get("final_result"),
+            "cpu_summary": cpu_result.get("summary"),
+            "gpu_summary": gpu_result.get("summary"),
         }
-        dst[y * dw + x] = static_cast<uint8_t>(sum / (scale_x * scale_y) + 0.5f);
-        return;
-    }
-    float sx = (x + 0.5f) * sw / dw - 0.5f, sy = (y + 0.5f) * sh / dh - 0.5f;
-    int raw_x0 = static_cast<int>(floorf(sx));
-    int raw_y0 = static_cast<int>(floorf(sy));
-    int x0 = max(0, min(sw - 1, raw_x0));
-    int y0 = max(0, min(sh - 1, raw_y0));
-    int x1 = max(0, min(sw - 1, raw_x0 + 1));
-    int y1 = max(0, min(sh - 1, raw_y0 + 1));
-    float ax = sx - floorf(sx), ay = sy - floorf(sy);
-    float value = (1 - ay) * ((1 - ax) * src[y0 * sw + x0] + ax * src[y0 * sw + x1]) + ay * ((1 - ax) * src[y1 * sw + x0] + ax * src[y1 * sw + x1]);
-    dst[y * dw + x] = static_cast<uint8_t>(value + 0.5f);
-}
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        raise AssertionError("Full pipeline CPU/GPU results differ; inspect the printed summaries and report JSON")
+    print("PASS full_pipeline: CPU and GPU inspection results are identical")
 
-__global__ void gaussian_horizontal_kernel(
-    const uint8_t* src,
-    float* intermediate,
-    int width,
-    int height,
-    int channels,
-    int radius) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    for (int c = 0; c < channels; ++c) {
-        float sum = 0.0f;
-        for (int kx = -radius; kx <= radius; ++kx) {
-            int sx = reflect101(x + kx, width);
-            sum += src[(y * width + sx) * channels + c] * gaussian_weights[kx + radius];
-        }
-        intermediate[(y * width + x) * channels + c] = sum;
-    }
-}
 
-__global__ void gaussian_vertical_kernel(
-    const float* intermediate,
-    uint8_t* dst,
-    int width,
-    int height,
-    int channels,
-    int radius) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    for (int c = 0; c < channels; ++c) {
-        float sum = 0.0f;
-        for (int ky = -radius; ky <= radius; ++ky) {
-            int sy = reflect101(y + ky, height);
-            sum += intermediate[(sy * width + x) * channels + c] * gaussian_weights[ky + radius];
-        }
-        dst[(y * width + x) * channels + c] =
-            static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, sum + 0.5f)));
-    }
-}
+def main() -> int:
+    args = parse_args()
+    runtime = GpuRuntime(args.dll, fallback_to_cpu=False)
+    if not runtime.available:
+        raise SystemExit(f"CUDA DLL unavailable: {runtime.unavailable_reason}")
+    print(
+        f"CUDA DLL ready: device={runtime.device_name}, capability={runtime.compute_capability}, "
+        f"path={runtime.dll_path}"
+    )
+    validate_primitives(runtime)
+    benchmark(runtime, args.benchmark)
+    if args.image and args.recipe:
+        validate_pipeline(Path(args.image), Path(args.recipe), str(runtime.dll_path))
+    print("All requested CUDA validations passed")
+    return 0
 
-__global__ void threshold_kernel(const uint8_t* src, uint8_t* dst, int count, int threshold, int max_value, int invert) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    bool high = src[i] > threshold;
-    dst[i] = static_cast<uint8_t>((invert ? !high : high) ? max_value : 0);
-}
 
-__global__ void replicate_border_kernel(
-    const uint8_t* src,
-    uint8_t* padded,
-    int width,
-    int height,
-    int padded_width,
-    int padded_height,
-    int radius) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= padded_width || y >= padded_height) return;
-    int source_x = max(0, min(width - 1, x - radius));
-    int source_y = max(0, min(height - 1, y - radius));
-    padded[y * padded_width + x] = src[source_y * width + source_x];
-}
-
-__global__ void row_prefix_u8_kernel(
-    const uint8_t* src,
-    unsigned long long* prefix,
-    int width,
-    int height) {
-    int row = blockIdx.x;
-    int lane = threadIdx.x;
-    if (row >= height) return;
-    __shared__ unsigned long long scan[SCAN_THREADS];
-    __shared__ unsigned long long carry;
-    __shared__ unsigned long long chunk_carry;
-    if (lane == 0) carry = 0;
-    __syncthreads();
-    for (int base = 0; base < width; base += SCAN_THREADS) {
-        int column = base + lane;
-        scan[lane] = column < width ? static_cast<unsigned long long>(src[row * width + column]) : 0ULL;
-        __syncthreads();
-        for (int offset = 1; offset < SCAN_THREADS; offset <<= 1) {
-            unsigned long long add = lane >= offset ? scan[lane - offset] : 0ULL;
-            __syncthreads();
-            scan[lane] += add;
-            __syncthreads();
-        }
-        if (lane == 0) chunk_carry = carry;
-        __syncthreads();
-        if (column < width) prefix[row * width + column] = scan[lane] + chunk_carry;
-        __syncthreads();
-        int valid = min(SCAN_THREADS, width - base);
-        if (lane == 0) carry = chunk_carry + scan[valid - 1];
-        __syncthreads();
-    }
-}
-
-__global__ void transpose_u64_kernel(
-    const unsigned long long* src,
-    unsigned long long* dst,
-    int width,
-    int height) {
-    __shared__ unsigned long long tile[TRANSPOSE_TILE][TRANSPOSE_TILE + 1];
-    int x = blockIdx.x * TRANSPOSE_TILE + threadIdx.x;
-    int y = blockIdx.y * TRANSPOSE_TILE + threadIdx.y;
-    for (int offset = 0; offset < TRANSPOSE_TILE; offset += TRANSPOSE_ROWS) {
-        if (x < width && y + offset < height) {
-            tile[threadIdx.y + offset][threadIdx.x] = src[(y + offset) * width + x];
-        }
-    }
-    __syncthreads();
-    x = blockIdx.y * TRANSPOSE_TILE + threadIdx.x;
-    y = blockIdx.x * TRANSPOSE_TILE + threadIdx.y;
-    for (int offset = 0; offset < TRANSPOSE_TILE; offset += TRANSPOSE_ROWS) {
-        if (x < height && y + offset < width) {
-            dst[(y + offset) * height + x] = tile[threadIdx.x][threadIdx.y + offset];
-        }
-    }
-}
-
-__global__ void row_prefix_u64_inplace_kernel(
-    unsigned long long* values,
-    int width,
-    int height) {
-    int row = blockIdx.x;
-    int lane = threadIdx.x;
-    if (row >= height) return;
-    __shared__ unsigned long long scan[SCAN_THREADS];
-    __shared__ unsigned long long carry;
-    __shared__ unsigned long long chunk_carry;
-    if (lane == 0) carry = 0;
-    __syncthreads();
-    for (int base = 0; base < width; base += SCAN_THREADS) {
-        int column = base + lane;
-        scan[lane] = column < width ? values[row * width + column] : 0ULL;
-        __syncthreads();
-        for (int offset = 1; offset < SCAN_THREADS; offset <<= 1) {
-            unsigned long long add = lane >= offset ? scan[lane - offset] : 0ULL;
-            __syncthreads();
-            scan[lane] += add;
-            __syncthreads();
-        }
-        if (lane == 0) chunk_carry = carry;
-        __syncthreads();
-        if (column < width) values[row * width + column] = scan[lane] + chunk_carry;
-        __syncthreads();
-        int valid = min(SCAN_THREADS, width - base);
-        if (lane == 0) carry = chunk_carry + scan[valid - 1];
-        __syncthreads();
-    }
-}
-
-__device__ unsigned long long integral_value_transposed(
-    const unsigned long long* integral_transposed,
-    int padded_height,
-    int x,
-    int y) {
-    if (x < 0 || y < 0) return 0ULL;
-    return integral_transposed[x * padded_height + y];
-}
-
-__global__ void adaptive_integral_kernel(
-    const uint8_t* src,
-    const unsigned long long* integral_transposed,
-    uint8_t* dst,
-    int width,
-    int height,
-    int padded_height,
-    int block_size,
-    float c,
-    int max_value,
-    int invert) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    int x0 = x;
-    int y0 = y;
-    int x1 = x + block_size - 1;
-    int y1 = y + block_size - 1;
-    unsigned long long bottom_right =
-        integral_value_transposed(integral_transposed, padded_height, x1, y1);
-    unsigned long long above =
-        integral_value_transposed(integral_transposed, padded_height, x1, y0 - 1);
-    unsigned long long left =
-        integral_value_transposed(integral_transposed, padded_height, x0 - 1, y1);
-    unsigned long long above_left =
-        integral_value_transposed(integral_transposed, padded_height, x0 - 1, y0 - 1);
-    unsigned long long sum = (bottom_right + above_left) - (above + left);
-    unsigned long long area = static_cast<unsigned long long>(block_size) * block_size;
-    int mean = static_cast<int>((sum + area / 2ULL) / area);
-    bool selected = invert
-        ? static_cast<int>(src[y * width + x]) <= mean - static_cast<int>(floorf(c))
-        : static_cast<int>(src[y * width + x]) > mean - static_cast<int>(ceilf(c));
-    dst[y * width + x] = static_cast<uint8_t>(selected ? max_value : 0);
-}
-
-__global__ void morph_kernel(const uint8_t* src, uint8_t* dst, int width, int height, int channels, int radius, int dilate) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    for (int c = 0; c < channels; ++c) {
-        int value = dilate ? 0 : 255;
-        for (int ky = -radius; ky <= radius; ++ky) for (int kx = -radius; kx <= radius; ++kx) {
-            int sx = x + kx, sy = y + ky;
-            int sample = (sx < 0 || sx >= width || sy < 0 || sy >= height) ? (dilate ? 0 : 255) : src[(sy * width + sx) * channels + c];
-            value = dilate ? max(value, sample) : min(value, sample);
-        }
-        dst[(y * width + x) * channels + c] = static_cast<uint8_t>(value);
-    }
-}
-
-dim3 grid2d(int width, int height) { return dim3((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y); }
-}
-
-VF_CUDA_API int vf_gpu_abi_version() { return VF_CUDA_ABI_VERSION; }
-
-VF_CUDA_API int vf_gpu_device_count() { int count = 0; return cudaGetDeviceCount(&count) == cudaSuccess ? count : 0; }
-
-VF_CUDA_API int vf_gpu_compute_capability() {
-    cudaDeviceProp prop{};
-    return cudaGetDeviceProperties(&prop, 0) == cudaSuccess ? prop.major * 10 + prop.minor : 0;
-}
-
-VF_CUDA_API int vf_gpu_device_name(char* output, int capacity) {
-    if (!output || capacity <= 0) return 1;
-    cudaDeviceProp prop{}; cudaError_t error = cudaGetDeviceProperties(&prop, 0);
-    if (error != cudaSuccess) return cuda_result(error);
-    strncpy_s(output, capacity, prop.name, _TRUNCATE); return 0;
-}
-
-VF_CUDA_API int vf_gpu_error_message(int error_code, char* output, int capacity) {
-    if (!output || capacity <= 0) return VF_CUDA_INVALID_ARGUMENT;
-    const char* message = "Unknown VisionFlow CUDA error";
-    switch (error_code) {
-        case VF_CUDA_OK: message = "Success"; break;
-        case VF_CUDA_INVALID_ARGUMENT: message = "Invalid argument"; break;
-        case VF_CUDA_ALLOCATION_FAILED: message = "Device allocation failed"; break;
-        case VF_CUDA_COPY_FAILED: message = "Host/device copy failed"; break;
-        case VF_CUDA_KERNEL_FAILED: message = "CUDA kernel failed"; break;
-        case VF_CUDA_DEVICE_UNAVAILABLE: message = "CUDA device unavailable"; break;
-        case VF_CUDA_ABI_MISMATCH: message = "CUDA DLL ABI mismatch"; break;
-        case VF_CUDA_INTERNAL_ERROR: message = "Internal CUDA DLL error"; break;
-        default:
-            if (error_code >= VF_CUDA_RUNTIME_ERROR_BASE) {
-                message = cudaGetErrorString(static_cast<cudaError_t>(error_code - VF_CUDA_RUNTIME_ERROR_BASE));
-            }
-            break;
-    }
-    strncpy_s(output, capacity, message, _TRUNCATE);
-    return VF_CUDA_OK;
-}
-
-VF_CUDA_API int vf_context_create(void** context) {
-    if (context == nullptr) return VF_CUDA_INVALID_ARGUMENT;
-    *context = nullptr;
-    PersistentContext* created = new (std::nothrow) PersistentContext();
-    if (created == nullptr) return VF_CUDA_ALLOCATION_FAILED;
-    *context = created;
-    return VF_CUDA_OK;
-}
-
-VF_CUDA_API int vf_context_destroy(void* context) {
-    delete static_cast<PersistentContext*>(context);
-    return VF_CUDA_OK;
-}
-
-VF_CUDA_API int vf_context_stats(
-    void* context,
-    uint64_t* reserved_bytes,
-    uint64_t* allocation_count) {
-    if (context == nullptr || reserved_bytes == nullptr || allocation_count == nullptr) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    PersistentContext* persistent = static_cast<PersistentContext*>(context);
-    uint64_t bytes = 0;
-    for (size_t capacity : persistent->u8_capacity) bytes += static_cast<uint64_t>(capacity);
-    bytes += static_cast<uint64_t>(persistent->float_capacity) * sizeof(float);
-    for (size_t capacity : persistent->u64_capacity) {
-        bytes += static_cast<uint64_t>(capacity) * sizeof(unsigned long long);
-    }
-    *reserved_bytes = bytes;
-    *allocation_count = persistent->allocation_count;
-    return VF_CUDA_OK;
-}
-
-VF_CUDA_API int vf_bgr_to_gray_u8(const uint8_t* src, int w, int h, int stride, int sc, uint8_t* dst, int dstride, int dc) {
-    if (sc != 3 || dc != 1) return VF_CUDA_INVALID_ARGUMENT;
-    uint8_t *ds = nullptr, *dd = nullptr;
-    int result = alloc_copy(src, w, h, stride, sc, &ds);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(w) * h);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    bgr_gray_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(ds, dd, w, h);
-    result = visionflow_cuda::kernel_result();
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, 1, dd);
-    else visionflow_cuda::free_device(dd);
-    visionflow_cuda::free_device(ds);
-    return result;
-}
-
-VF_CUDA_API int vf_bgr_to_rgb_u8(const uint8_t* src, int w, int h, int stride, int sc, uint8_t* dst, int dstride, int dc) {
-    if (sc != 3 || dc != 3) return VF_CUDA_INVALID_ARGUMENT;
-    uint8_t *ds = nullptr, *dd = nullptr;
-    int result = alloc_copy(src, w, h, stride, sc, &ds);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(w) * h * 3);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    bgr_rgb_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(ds, dd, w, h);
-    result = visionflow_cuda::kernel_result();
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, 3, dd);
-    else visionflow_cuda::free_device(dd);
-    visionflow_cuda::free_device(ds);
-    return result;
-}
-
-VF_CUDA_API int vf_crop_u8(const uint8_t* src,int w,int h,int stride,int sc,uint8_t* dst,int dstride,int dc,int x,int y,int cw,int ch) {
-    if (sc != dc || (sc != 1 && sc != 3) || x < 0 || y < 0 || cw <= 0 || ch <= 0 || x + cw > w || y + ch > h) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    uint8_t *ds = nullptr, *dd = nullptr;
-    int result = alloc_copy(src, w, h, stride, sc, &ds);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(cw) * ch * sc);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    crop_kernel<<<grid2d(cw, ch), dim3(BLOCK_X, BLOCK_Y)>>>(ds, dd, w, x, y, cw, ch, sc);
-    result = visionflow_cuda::kernel_result();
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, cw, ch, sc, dd);
-    else visionflow_cuda::free_device(dd);
-    visionflow_cuda::free_device(ds);
-    return result;
-}
-
-VF_CUDA_API int vf_resize_gray_u8(const uint8_t* src,int w,int h,int stride,int sc,uint8_t* dst,int dstride,int dc,int dw,int dh) {
-    if (sc != 1 || dc != 1 || dw <= 0 || dh <= 0) return VF_CUDA_INVALID_ARGUMENT;
-    uint8_t *ds = nullptr, *dd = nullptr;
-    int result = alloc_copy(src, w, h, stride, 1, &ds);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(dw) * dh);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    resize_gray_kernel<<<grid2d(dw, dh), dim3(BLOCK_X, BLOCK_Y)>>>(ds, dd, w, h, dw, dh);
-    result = visionflow_cuda::kernel_result();
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, dw, dh, 1, dd);
-    else visionflow_cuda::free_device(dd);
-    visionflow_cuda::free_device(ds);
-    return result;
-}
-
-VF_CUDA_API int vf_gaussian_blur_u8(const uint8_t* src,int w,int h,int stride,int sc,uint8_t* dst,int dstride,int dc,int kernel) {
-    if (sc != dc || (sc != 1 && sc != 3) || kernel < 3 || kernel % 2 == 0 || kernel > MAX_GAUSSIAN_KERNEL) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    uint8_t *ds = nullptr, *dd = nullptr;
-    float* intermediate = nullptr;
-    int result = alloc_copy(src, w, h, stride, sc, &ds);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(w) * h * sc);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    cudaError_t error = cudaMalloc(&intermediate, static_cast<size_t>(w) * h * sc * sizeof(float));
-    if (error != cudaSuccess) {
-        visionflow_cuda::free_device(dd);
-        visionflow_cuda::free_device(ds);
-        return cuda_result(error);
-    }
-
-    int radius = 0;
-    result = prepare_gaussian_weights(kernel, &radius);
-    if (result != VF_CUDA_OK) {
-        visionflow_cuda::free_device(intermediate);
-        visionflow_cuda::free_device(dd);
-        visionflow_cuda::free_device(ds);
-        return result;
-    }
-    gaussian_horizontal_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(ds, intermediate, w, h, sc, radius);
-    gaussian_vertical_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(intermediate, dd, w, h, sc, radius);
-    result = visionflow_cuda::kernel_result();
-    visionflow_cuda::free_device(intermediate);
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, sc, dd);
-    else visionflow_cuda::free_device(dd);
-    visionflow_cuda::free_device(ds);
-    return result;
-}
-
-VF_CUDA_API int vf_threshold_u8(const uint8_t* src,int w,int h,int stride,int sc,uint8_t* dst,int dstride,int dc,int threshold,int max_value,int invert) {
-    if (sc != 1 || dc != 1 || threshold < 0 || threshold > 255 || max_value < 0 || max_value > 255) return VF_CUDA_INVALID_ARGUMENT;
-    uint8_t *ds = nullptr, *dd = nullptr;
-    int result = alloc_copy(src, w, h, stride, 1, &ds);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(w) * h);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    int count = w * h;
-    threshold_kernel<<<(count + 255) / 256, 256>>>(ds, dd, count, threshold, max_value, invert);
-    result = visionflow_cuda::kernel_result();
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, 1, dd);
-    else visionflow_cuda::free_device(dd);
-    visionflow_cuda::free_device(ds);
-    return result;
-}
-
-VF_CUDA_API int vf_adaptive_mean_u8(const uint8_t* src,int w,int h,int stride,int sc,uint8_t* dst,int dstride,int dc,int block,float c,int max_value,int invert) {
-    if (w <= 0 || h <= 0 || sc != 1 || dc != 1 || block < 3 || block % 2 == 0 ||
-        max_value < 0 || max_value > 255 || !std::isfinite(c)) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    int radius = 0, padded_width = 0, padded_height = 0;
-    size_t padded_count = 0;
-    int result = adaptive_layout(
-        w, h, block, &radius, &padded_width, &padded_height, &padded_count);
-    if (result != VF_CUDA_OK) return result;
-    uint8_t *ds = nullptr, *dd = nullptr;
-    uint8_t* padded = nullptr;
-    unsigned long long* row_prefix = nullptr;
-    unsigned long long* integral_transposed = nullptr;
-    result = alloc_copy(src, w, h, stride, 1, &ds);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(w) * h);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    result = visionflow_cuda::allocate_bytes(&padded, padded_count);
-    if (result != VF_CUDA_OK) {
-        visionflow_cuda::free_device(dd);
-        visionflow_cuda::free_device(ds);
-        return result;
-    }
-    cudaError_t error = cudaMalloc(&row_prefix, padded_count * sizeof(unsigned long long));
-    if (error == cudaSuccess) error = cudaMalloc(&integral_transposed, padded_count * sizeof(unsigned long long));
-    if (error != cudaSuccess) {
-        visionflow_cuda::free_device(integral_transposed);
-        visionflow_cuda::free_device(row_prefix);
-        visionflow_cuda::free_device(padded);
-        visionflow_cuda::free_device(dd);
-        visionflow_cuda::free_device(ds);
-        return cuda_result(error);
-    }
-    replicate_border_kernel<<<grid2d(padded_width, padded_height), dim3(BLOCK_X, BLOCK_Y)>>>(
-        ds, padded, w, h, padded_width, padded_height, radius);
-    row_prefix_u8_kernel<<<padded_height, SCAN_THREADS>>>(padded, row_prefix, padded_width, padded_height);
-    dim3 transpose_block(TRANSPOSE_TILE, TRANSPOSE_ROWS);
-    dim3 transpose_grid(
-        (padded_width + TRANSPOSE_TILE - 1) / TRANSPOSE_TILE,
-        (padded_height + TRANSPOSE_TILE - 1) / TRANSPOSE_TILE);
-    transpose_u64_kernel<<<transpose_grid, transpose_block>>>(
-        row_prefix, integral_transposed, padded_width, padded_height);
-    row_prefix_u64_inplace_kernel<<<padded_width, SCAN_THREADS>>>(
-        integral_transposed, padded_height, padded_width);
-    adaptive_integral_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(
-        ds, integral_transposed, dd, w, h, padded_height, block, c, max_value, invert);
-    result = visionflow_cuda::kernel_result();
-    visionflow_cuda::free_device(integral_transposed);
-    visionflow_cuda::free_device(row_prefix);
-    visionflow_cuda::free_device(padded);
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, 1, dd);
-    else visionflow_cuda::free_device(dd);
-    visionflow_cuda::free_device(ds);
-    return result;
-}
-
-VF_CUDA_API int vf_preprocess_401_2_u8(
-    void* context,
-    const uint8_t* src,
-    int w,
-    int h,
-    int stride,
-    int sc,
-    uint8_t* dst,
-    int dstride,
-    int gaussian_kernel,
-    int adaptive_block,
-    float adaptive_c,
-    int max_value,
-    int invert) {
-    if (context == nullptr || w <= 0 || h <= 0 || (sc != 1 && sc != 3) ||
-        w > INT_MAX / sc || !visionflow_cuda::valid_image(src, w, h, stride, sc) ||
-        !visionflow_cuda::valid_image(dst, w, h, dstride, 1) ||
-        max_value < 0 || max_value > 255 || !std::isfinite(adaptive_c)) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    if (static_cast<size_t>(w) > SIZE_MAX / static_cast<size_t>(h)) return VF_CUDA_INVALID_ARGUMENT;
-    size_t pixel_count = static_cast<size_t>(w) * static_cast<size_t>(h);
-    if (pixel_count > SIZE_MAX / static_cast<size_t>(sc)) return VF_CUDA_INVALID_ARGUMENT;
-    size_t source_count = pixel_count * static_cast<size_t>(sc);
-
-    int radius = 0;
-    int result = prepare_gaussian_weights(gaussian_kernel, &radius);
-    if (result != VF_CUDA_OK) return result;
-    int adaptive_radius = 0, padded_width = 0, padded_height = 0;
-    size_t padded_count = 0;
-    result = adaptive_layout(
-        w,
-        h,
-        adaptive_block,
-        &adaptive_radius,
-        &padded_width,
-        &padded_height,
-        &padded_count);
-    if (result != VF_CUDA_OK) return result;
-
-    PersistentContext* persistent = static_cast<PersistentContext*>(context);
-    result = reserve_device(
-        &persistent->u8[0], &persistent->u8_capacity[0], source_count, &persistent->allocation_count);
-    if (result == VF_CUDA_OK) {
-        result = reserve_device(
-            &persistent->u8[1], &persistent->u8_capacity[1], pixel_count, &persistent->allocation_count);
-    }
-    if (result == VF_CUDA_OK) {
-        result = reserve_device(
-            &persistent->u8[2], &persistent->u8_capacity[2], pixel_count, &persistent->allocation_count);
-    }
-    if (result == VF_CUDA_OK) {
-        result = reserve_device(
-            &persistent->u8[3], &persistent->u8_capacity[3], padded_count, &persistent->allocation_count);
-    }
-    if (result == VF_CUDA_OK) {
-        result = reserve_device(
-            &persistent->float_buffer,
-            &persistent->float_capacity,
-            pixel_count,
-            &persistent->allocation_count);
-    }
-    if (result == VF_CUDA_OK) {
-        result = reserve_device(
-            &persistent->u64[0],
-            &persistent->u64_capacity[0],
-            padded_count,
-            &persistent->allocation_count);
-    }
-    if (result == VF_CUDA_OK) {
-        result = reserve_device(
-            &persistent->u64[1],
-            &persistent->u64_capacity[1],
-            padded_count,
-            &persistent->allocation_count);
-    }
-    if (result != VF_CUDA_OK) return result;
-
-    size_t source_row_bytes = static_cast<size_t>(w) * static_cast<size_t>(sc);
-    cudaError_t error = cudaMemcpy2D(
-        persistent->u8[0],
-        source_row_bytes,
-        src,
-        stride,
-        source_row_bytes,
-        h,
-        cudaMemcpyHostToDevice);
-    if (error != cudaSuccess) return cuda_result(error);
-
-    uint8_t* gray = persistent->u8[0];
-    if (sc == 3) {
-        gray = persistent->u8[1];
-        bgr_gray_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(
-            persistent->u8[0], gray, w, h);
-    }
-    gaussian_horizontal_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(
-        gray, persistent->float_buffer, w, h, 1, radius);
-    gaussian_vertical_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(
-        persistent->float_buffer, gray, w, h, 1, radius);
-    replicate_border_kernel<<<grid2d(padded_width, padded_height), dim3(BLOCK_X, BLOCK_Y)>>>(
-        gray,
-        persistent->u8[3],
-        w,
-        h,
-        padded_width,
-        padded_height,
-        adaptive_radius);
-    row_prefix_u8_kernel<<<padded_height, SCAN_THREADS>>>(
-        persistent->u8[3], persistent->u64[0], padded_width, padded_height);
-    dim3 transpose_block(TRANSPOSE_TILE, TRANSPOSE_ROWS);
-    dim3 transpose_grid(
-        (padded_width + TRANSPOSE_TILE - 1) / TRANSPOSE_TILE,
-        (padded_height + TRANSPOSE_TILE - 1) / TRANSPOSE_TILE);
-    transpose_u64_kernel<<<transpose_grid, transpose_block>>>(
-        persistent->u64[0], persistent->u64[1], padded_width, padded_height);
-    row_prefix_u64_inplace_kernel<<<padded_width, SCAN_THREADS>>>(
-        persistent->u64[1], padded_height, padded_width);
-    adaptive_integral_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(
-        gray,
-        persistent->u64[1],
-        persistent->u8[2],
-        w,
-        h,
-        padded_height,
-        adaptive_block,
-        adaptive_c,
-        max_value,
-        invert);
-    result = visionflow_cuda::kernel_result();
-    if (result != VF_CUDA_OK) return result;
-
-    error = cudaMemcpy2D(
-        dst,
-        dstride,
-        persistent->u8[2],
-        static_cast<size_t>(w),
-        static_cast<size_t>(w),
-        h,
-        cudaMemcpyDeviceToHost);
-    return cuda_result(error);
-}
-
-VF_CUDA_API int vf_morphology_rect_u8(const uint8_t* src,int w,int h,int stride,int sc,uint8_t* dst,int dstride,int dc,int operation,int kernel,int iterations) {
-    if (sc != dc || (sc != 1 && sc != 3) || kernel < 3 || kernel % 2 == 0 || iterations < 1 || operation < VF_MORPH_OPEN || operation > VF_MORPH_ERODE) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    uint8_t *a = nullptr, *b = nullptr;
-    int result = alloc_copy(src, w, h, stride, sc, &a);
-    if (result != VF_CUDA_OK) return result;
-    result = visionflow_cuda::allocate_bytes(&b, static_cast<size_t>(w) * h * sc);
-    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(a); return result; }
-    auto pass = [&](int dilate) {
-        morph_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(a, b, w, h, sc, kernel / 2, dilate);
-        std::swap(a, b);
-    };
-    if (operation == VF_MORPH_OPEN) {
-        for (int i = 0; i < iterations; ++i) pass(0);
-        for (int i = 0; i < iterations; ++i) pass(1);
-    } else if (operation == VF_MORPH_CLOSE) {
-        for (int i = 0; i < iterations; ++i) pass(1);
-        for (int i = 0; i < iterations; ++i) pass(0);
-    } else {
-        for (int i = 0; i < iterations; ++i) pass(operation == VF_MORPH_DILATE);
-    }
-    result = visionflow_cuda::kernel_result();
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, sc, a);
-    else visionflow_cuda::free_device(a);
-    visionflow_cuda::free_device(b);
-    return result;
-}
+if __name__ == "__main__":
+    raise SystemExit(main())

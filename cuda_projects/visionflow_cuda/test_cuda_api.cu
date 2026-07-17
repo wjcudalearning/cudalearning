@@ -1,84 +1,73 @@
-#ifndef VISIONFLOW_CUDA_INTERNAL_CUH
-#define VISIONFLOW_CUDA_INTERNAL_CUH
+#include <iostream>
+#include <vector>
+#include "visionflow_cuda.h"
 
-#include <cuda_runtime.h>
-#include <cstddef>
-#include <cstdint>
-#include "visionflow_cuda_errors.h"
-
-namespace visionflow_cuda {
-
-inline int runtime_error(cudaError_t error) {
-    return error == cudaSuccess ? VF_CUDA_OK : VF_CUDA_RUNTIME_ERROR_BASE + static_cast<int>(error);
-}
-
-inline bool valid_image(
-    const uint8_t* src,
-    int width,
-    int height,
-    int stride,
-    int channels) {
-    return src != nullptr && width > 0 && height > 0 && channels > 0 &&
-        stride >= width * channels;
-}
-
-inline int allocate_bytes(uint8_t** device, std::size_t bytes) {
-    if (device == nullptr || bytes == 0) return VF_CUDA_INVALID_ARGUMENT;
-    cudaError_t error = cudaMalloc(device, bytes);
-    return error == cudaSuccess ? VF_CUDA_OK : runtime_error(error);
-}
-
-inline int allocate_and_upload(
-    const uint8_t* host,
-    int width,
-    int height,
-    int stride,
-    int channels,
-    uint8_t** device) {
-    if (!valid_image(host, width, height, stride, channels) || device == nullptr) {
-        return VF_CUDA_INVALID_ARGUMENT;
+int main() {
+    std::cout << "VisionFlow CUDA ABI: " << vf_gpu_abi_version() << "\n";
+    if (vf_gpu_abi_version() != VF_CUDA_ABI_VERSION) {
+        std::cerr << "ABI mismatch\n";
+        return 2;
     }
-    const std::size_t row_bytes = static_cast<std::size_t>(width) * channels;
-    int result = allocate_bytes(device, row_bytes * height);
-    if (result != VF_CUDA_OK) return result;
-    cudaError_t error = cudaMemcpy2D(
-        *device, row_bytes, host, stride, row_bytes, height, cudaMemcpyHostToDevice);
-    if (error != cudaSuccess) {
-        cudaFree(*device);
-        *device = nullptr;
-        return runtime_error(error);
+
+    int count = vf_gpu_device_count();
+    std::cout << "CUDA device count: " << count << "\n";
+    if (count <= 0) {
+        std::cerr << "No CUDA device\n";
+        return 3;
     }
-    return VF_CUDA_OK;
-}
 
-inline int download_and_free(
-    uint8_t* host,
-    int stride,
-    int width,
-    int height,
-    int channels,
-    uint8_t* device) {
-    if (!valid_image(host, width, height, stride, channels) || device == nullptr) {
-        if (device != nullptr) cudaFree(device);
-        return VF_CUDA_INVALID_ARGUMENT;
+    char name[256]{};
+    int result = vf_gpu_device_name(name, static_cast<int>(sizeof(name)));
+    if (result != VF_CUDA_OK) {
+        char message[256]{};
+        vf_gpu_error_message(result, message, static_cast<int>(sizeof(message)));
+        std::cerr << "Device query failed: " << message << "\n";
+        return 4;
     }
-    const std::size_t row_bytes = static_cast<std::size_t>(width) * channels;
-    cudaError_t error = cudaMemcpy2D(
-        host, stride, device, row_bytes, row_bytes, height, cudaMemcpyDeviceToHost);
-    cudaFree(device);
-    return runtime_error(error);
+
+    int capability = vf_gpu_compute_capability();
+    std::cout << "Device: " << name << "\n";
+    std::cout << "Compute capability: " << capability / 10 << "." << capability % 10 << "\n";
+
+    const int width = 8;
+    const int height = 8;
+    std::vector<uint8_t> bgr(width * height * 3, 128);
+    std::vector<uint8_t> gray(width * height, 0);
+    result = vf_bgr_to_gray_u8(
+        bgr.data(), width, height, width * 3, 3,
+        gray.data(), width, 1);
+    if (result != VF_CUDA_OK) {
+        char message[256]{};
+        vf_gpu_error_message(result, message, static_cast<int>(sizeof(message)));
+        std::cerr << "Grayscale smoke failed: " << message << "\n";
+        return 5;
+    }
+
+    void* context = nullptr;
+    result = vf_context_create(&context);
+    if (result != VF_CUDA_OK || context == nullptr) {
+        std::cerr << "Persistent context creation failed\n";
+        return 6;
+    }
+    std::vector<uint8_t> fused_binary(width * height, 0);
+    result = vf_preprocess_401_2_u8(
+        context,
+        bgr.data(), width, height, width * 3, 3,
+        fused_binary.data(), width,
+        3, 3, -2.0f, 255, 1);
+    uint64_t reserved_bytes = 0;
+    uint64_t allocation_count = 0;
+    int stats_result = vf_context_stats(context, &reserved_bytes, &allocation_count);
+    int destroy_result = vf_context_destroy(context);
+    if (result != VF_CUDA_OK || stats_result != VF_CUDA_OK || destroy_result != VF_CUDA_OK ||
+        reserved_bytes == 0 || allocation_count == 0) {
+        char message[256]{};
+        int failed = result != VF_CUDA_OK ? result : stats_result != VF_CUDA_OK ? stats_result : destroy_result;
+        vf_gpu_error_message(failed, message, static_cast<int>(sizeof(message)));
+        std::cerr << "Fused 401-2 smoke failed: " << message << "\n";
+        return 7;
+    }
+
+    std::cout << "C ABI, grayscale and fused 401-2 smoke passed\n";
+    return 0;
 }
-
-inline int kernel_result() {
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) return runtime_error(error);
-    return runtime_error(cudaDeviceSynchronize());
-}
-
-inline void free_device(void* pointer) {
-    if (pointer != nullptr) cudaFree(pointer);
-}
-
-}  // namespace visionflow_cuda
-
-#endif

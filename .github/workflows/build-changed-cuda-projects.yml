@@ -45,11 +45,6 @@ jobs:
           }
           trap cleanup EXIT
 
-          project_has_cuda() {
-            local project_dir="$1"
-            [[ -n "$(find "$project_dir" -maxdepth 3 -type f -name '*.cu' -print -quit 2>/dev/null)" ]]
-          }
-
           list_all_projects() {
             if [[ ! -d "$ROOT" ]]; then
               return 0
@@ -61,7 +56,7 @@ jobs:
               -type d \
               -print |
             while IFS= read -r project_dir; do
-              if project_has_cuda "$project_dir"; then
+              if compgen -G "$project_dir/*.cu" > /dev/null; then
                 basename "$project_dir"
               fi
             done
@@ -77,7 +72,8 @@ jobs:
                   project_name="${project_name%%/*}"
                   project_dir="$ROOT/$project_name"
 
-                  if [[ -d "$project_dir" ]] && project_has_cuda "$project_dir"; then
+                  if [[ -d "$project_dir" ]] &&
+                     compgen -G "$project_dir/*.cu" > /dev/null; then
                     printf '%s\n' "$project_name"
                   fi
                   ;;
@@ -90,14 +86,18 @@ jobs:
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "Manual run: build all CUDA projects."
             build_all=true
-          elif [[ -z "${BEFORE_SHA:-}" ]] || [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+          elif [[ -z "${BEFORE_SHA:-}" ]] ||
+               [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
             echo "No usable previous SHA: build all CUDA projects."
             build_all=true
           elif ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
             echo "Previous commit is unavailable: build all CUDA projects."
             build_all=true
           else
-            git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" > "$CHANGED_LIST"
+            git diff \
+              --name-only \
+              "$BEFORE_SHA" \
+              "$CURRENT_SHA" > "$CHANGED_LIST"
 
             echo "Changed files:"
             sed 's/^/ - /' "$CHANGED_LIST"
@@ -117,7 +117,10 @@ jobs:
           sort -u "$PROJECT_LIST" -o "$PROJECT_LIST"
 
           projects_json="$(
-            jq -R -s -c \
+            jq \
+              -R \
+              -s \
+              -c \
               'split("\n") | map(select(length > 0))' \
               < "$PROJECT_LIST"
           )"
@@ -155,166 +158,81 @@ jobs:
           method: "network"
           sub-packages: '["nvcc", "cudart"]'
 
-      - name: Compile DLL and test executable
-        shell: pwsh
+      - name: Compile changed project
+        shell: cmd
         run: |
-          $ErrorActionPreference = "Stop"
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
 
-          $vsDevCmd = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
-          if (-not (Test-Path $vsDevCmd)) {
-            throw "Visual Studio developer command file not found: $vsDevCmd"
-          }
+          setlocal EnableDelayedExpansion
 
-          cmd /c "call `"$vsDevCmd`" -arch=amd64 -host_arch=amd64 >nul && set" |
-            ForEach-Object {
-              if ($_ -match '^([^=]+)=(.*)$') {
-                Set-Item -Path "Env:$($matches[1])" -Value $matches[2]
-              }
-            }
+          set "PROJECT_NAME=${{ matrix.project }}"
+          set "PROJECT_DIR=cuda_projects\${{ matrix.project }}"
+          set "BUILD_DIR=build\${{ matrix.project }}"
+          set "DLL_PATH=build\${{ matrix.project }}\${{ matrix.project }}.dll"
 
-          $project = "${{ matrix.project }}"
-          $projectPath = Join-Path "cuda_projects" $project
-          $buildPath = Join-Path "build" $project
-          $configPath = Join-Path $projectPath "cuda_project.json"
-          $dllPath = Join-Path $buildPath "$project.dll"
-          $libPath = Join-Path $buildPath "$project.lib"
+          if not exist "!PROJECT_DIR!" (
+            echo Missing project folder: !PROJECT_DIR!
+            exit /b 1
+          )
 
-          if (-not (Test-Path $projectPath)) {
-            throw "Missing project folder: $projectPath"
-          }
+          if not exist "!PROJECT_DIR!\*.cu" (
+            echo No .cu file found in: !PROJECT_DIR!
+            exit /b 1
+          )
 
-          New-Item -ItemType Directory -Force -Path $buildPath | Out-Null
+          if not exist "!BUILD_DIR!" mkdir "!BUILD_DIR!"
 
-          $dllSourceNames = @()
-          $testSourceNames = @()
-          $includeNames = @(".")
-          $testExecutable = "test_$project.exe"
-          $packageFiles = @()
-
-          if (Test-Path $configPath) {
-            $config = Get-Content $configPath -Raw | ConvertFrom-Json
-            $dllSourceNames = @($config.dll_sources)
-            $testSourceNames = @($config.test_sources)
-            $includeNames += @($config.include_dirs)
-            if ($config.test_executable) {
-              $testExecutable = [string]$config.test_executable
-            }
-            $packageFiles = @($config.package_files)
-          }
-          else {
-            $primarySource = Join-Path $projectPath "$project.cu"
-            if (Test-Path $primarySource) {
-              $dllSourceNames = @("$project.cu")
-            }
-            else {
-              $dllSourceNames = @(
-                Get-ChildItem -Path $projectPath -File -Filter "*.cu" |
-                  Where-Object { $_.Name -notmatch '^(test|benchmark)[_-]' } |
-                  ForEach-Object { $_.Name }
-              )
-            }
-            $testSourceNames = @(
-              Get-ChildItem -Path $projectPath -File -Filter "*.cu" |
-                Where-Object { $_.Name -match '^(test|benchmark)[_-]' } |
-                ForEach-Object { $_.Name }
+          if exist "!PROJECT_DIR!\build_cuda_dll.ps1" (
+            echo Using project build script: !PROJECT_DIR!\build_cuda_dll.ps1
+            powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass ^
+              -File "!PROJECT_DIR!\build_cuda_dll.ps1" ^
+              -Architecture sm_86 ^
+              -OutputDirectory "!BUILD_DIR!"
+            if errorlevel 1 exit /b !errorlevel!
+          ) else (
+            set "CU_FILES="
+            for %%F in ("!PROJECT_DIR!\*.cu") do (
+              set CU_FILES=!CU_FILES! "%%~fF"
             )
-            if (Test-Path (Join-Path $projectPath "include")) {
-              $includeNames += "include"
-            }
-          }
 
-          if ($dllSourceNames.Count -eq 0) {
-            throw "No DLL CUDA sources selected for $project"
-          }
+            echo Using generic CUDA project build.
+            echo Building project: !PROJECT_NAME!
+            echo CUDA sources: !CU_FILES!
 
-          $dllSources = @(
-            $dllSourceNames | ForEach-Object {
-              $path = Join-Path $projectPath $_
-              if (-not (Test-Path $path)) {
-                throw "Configured DLL source not found: $path"
-              }
-              (Resolve-Path $path).Path
-            }
+            nvcc --version
+
+            nvcc ^
+              -std=c++17 ^
+              -O2 ^
+              --shared ^
+              --cudart static ^
+              -arch=sm_86 ^
+              -Xcompiler "/MD /EHsc" ^
+              -DCUDA_DLL_EXPORTS ^
+              -I"!PROJECT_DIR!" ^
+              -I"!PROJECT_DIR!\include" ^
+              !CU_FILES! ^
+              -o "!DLL_PATH!"
+
+            if errorlevel 1 exit /b !errorlevel!
           )
 
-          $testSources = @(
-            $testSourceNames | ForEach-Object {
-              $path = Join-Path $projectPath $_
-              if (-not (Test-Path $path)) {
-                throw "Configured test source not found: $path"
-              }
-              (Resolve-Path $path).Path
-            }
+          if not exist "!DLL_PATH!" (
+            echo Expected DLL was not created: !DLL_PATH!
+            exit /b 1
           )
 
-          $includeArgs = @(
-            $includeNames |
-              Where-Object { $_ } |
-              Select-Object -Unique |
-              ForEach-Object {
-                $path = Join-Path $projectPath $_
-                if (-not (Test-Path $path)) {
-                  throw "Configured include directory not found: $path"
-                }
-                "-I$((Resolve-Path $path).Path)"
-              }
-          )
+          dir "!BUILD_DIR!"
 
-          $commonArgs = @(
-            "-std=c++17",
-            "-O2",
-            "--cudart", "static",
-            "-arch=sm_86",
-            "-Xcompiler=/MD,/EHsc"
-          ) + $includeArgs
-
-          Write-Host "Project: $project"
-          Write-Host "DLL sources: $($dllSources -join ', ')"
-          Write-Host "Test sources: $($testSources -join ', ')"
-          Write-Host "Include args: $($includeArgs -join ', ')"
-          nvcc --version
-
-          & nvcc @commonArgs "-DCUDA_DLL_EXPORTS" --shared @dllSources -o $dllPath
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          if (-not (Test-Path $dllPath)) {
-            throw "DLL was not generated: $dllPath"
-          }
-          if (-not (Test-Path $libPath)) {
-            throw "Import library was not generated: $libPath"
-          }
-
-          if ($testSources.Count -gt 0) {
-            $testPath = Join-Path $buildPath $testExecutable
-            & nvcc @commonArgs @testSources $libPath -o $testPath
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            if (-not (Test-Path $testPath)) {
-              throw "Test executable was not generated: $testPath"
-            }
-          }
-
-          Get-ChildItem -Path $buildPath |
-            ForEach-Object { Write-Host "Built: $($_.FullName)" }
-
-      - name: Verify DLL exports
-        shell: pwsh
+      - name: Verify DLL exports and dependencies
+        shell: cmd
         run: |
-          $ErrorActionPreference = "Stop"
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          dumpbin /exports "build\${{ matrix.project }}\${{ matrix.project }}.dll"
+          if errorlevel 1 exit /b %errorlevel%
+          dumpbin /dependents "build\${{ matrix.project }}\${{ matrix.project }}.dll"
 
-          $vsDevCmd = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
-          cmd /c "call `"$vsDevCmd`" -arch=amd64 -host_arch=amd64 >nul && set" |
-            ForEach-Object {
-              if ($_ -match '^([^=]+)=(.*)$') {
-                Set-Item -Path "Env:$($matches[1])" -Value $matches[2]
-              }
-            }
-
-          $project = "${{ matrix.project }}"
-          $dllPath = Join-Path (Join-Path "build" $project) "$project.dll"
-          dumpbin /exports $dllPath
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Package DLL, tests and public files
+      - name: Package DLL and project files
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -323,47 +241,41 @@ jobs:
           $projectPath = Join-Path "cuda_projects" $project
           $buildPath = Join-Path "build" $project
           $packagePath = Join-Path "package" $project
-          $configPath = Join-Path $projectPath "cuda_project.json"
 
           New-Item -ItemType Directory -Force -Path $packagePath | Out-Null
 
-          Get-ChildItem -Path $buildPath -File |
-            Where-Object { $_.Extension -in @(".dll", ".lib", ".exp", ".exe") } |
-            Copy-Item -Destination $packagePath
+          Copy-Item (Join-Path $buildPath "$project.dll") $packagePath
 
-          $includePath = Join-Path $projectPath "include"
-          if (Test-Path $includePath) {
-            Copy-Item $includePath (Join-Path $packagePath "include") -Recurse
-          }
-
-          $packageFiles = @()
-          if (Test-Path $configPath) {
-            $config = Get-Content $configPath -Raw | ConvertFrom-Json
-            $packageFiles = @($config.package_files)
-          }
-
-          if ($packageFiles.Count -gt 0) {
-            foreach ($relativePath in $packageFiles) {
-              $source = Join-Path $projectPath $relativePath
-              if (-not (Test-Path $source)) {
-                throw "Configured package file not found: $source"
-              }
-              Copy-Item $source $packagePath -Recurse -Force
+          foreach ($name in @(
+            "$project.lib",
+            "$project.exp",
+            "test_cuda_api.exe",
+            "cuda_build_preflight.json"
+          )) {
+            $compiledFile = Join-Path $buildPath $name
+            if (Test-Path -LiteralPath $compiledFile) {
+              Copy-Item -LiteralPath $compiledFile -Destination $packagePath
             }
           }
-          else {
-            Get-ChildItem -Path $projectPath -File |
-              Where-Object {
-                $_.Extension -in @(".h", ".hpp", ".cuh", ".py", ".md", ".json", ".txt", ".ps1")
-              } |
-              Copy-Item -Destination $packagePath
+
+          $includePath = Join-Path $projectPath "include"
+          if (Test-Path -LiteralPath $includePath) {
+            Copy-Item -LiteralPath $includePath -Destination $packagePath -Recurse
           }
 
+          Get-ChildItem -Path $projectPath -File |
+            Where-Object {
+              $_.Extension -in @(".h", ".hpp", ".cuh", ".py", ".ps1", ".json", ".md")
+            } |
+            Copy-Item -Destination $packagePath
+
           Get-ChildItem -Path $packagePath -Recurse |
-            ForEach-Object { Write-Host "Packaged: $($_.FullName)" }
+            ForEach-Object {
+              Write-Host "Packaged: $($_.FullName)"
+            }
 
       - name: Upload project artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.project }}-windows-x64-sm86
           path: package/${{ matrix.project }}/

@@ -129,3 +129,13 @@ C++ standard: C++17
 ```
 
 `sm_86` 適用 RTX 3090。
+
+## 專案自訂 build script
+
+若 `cuda_projects/<project>/build_cuda_dll.ps1` 存在，workflow 會優先執行該腳本，並傳入：
+
+```powershell
+-Architecture sm_86 -OutputDirectory build\<project>
+```
+
+這適合 DLL source 與測試 `.cu` 必須分開編譯的專案，例如 `visionflow_cuda`。沒有自訂腳本的舊專案仍走原本的通用 DLL build。

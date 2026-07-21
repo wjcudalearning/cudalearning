@@ -99,7 +99,7 @@ def inspect_contract() -> dict:
     header = PROJECT_DIR / "include" / "visionflow_cuda.h"
     source = PROJECT_DIR / "visionflow_cuda.cu"
     smoke = PROJECT_DIR / "test_cuda_api.cu"
-    build_script = PROJECT_DIR.parents[1] / ".github" / "scripts" / "build_cuda_project.ps1"
+    build_script = PROJECT_DIR / "build_cuda_dll.ps1"
     required_files = [header, source, smoke, PROJECT_DIR / "cuda_project.json", build_script]
     missing = [str(path) for path in required_files if not path.is_file()]
     if missing:
@@ -163,7 +163,7 @@ def inspect_contract() -> dict:
         if declared and declared != group:
             errors.append(f"optional export group '{group_name}' is incomplete: {sorted(group - declared)}")
     if "dll_sources" not in build_text or "test_targets" not in build_text:
-        errors.append("common Action builder does not read the explicit source manifest")
+        errors.append("project Action builder does not read the explicit source manifest")
     if errors:
         raise AssertionError("CUDA Action preflight failed:\n- " + "\n- ".join(errors))
 

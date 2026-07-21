@@ -26,7 +26,7 @@
  */
 
 #if defined(_WIN32)
-#  if defined(VISIONFLOW_CUDA_EXPORTS) || defined(CUDA_DLL_EXPORTS)
+#  if defined(VISIONFLOW_CUDA_EXPORTS)
 #    define VF_CUDA_API __declspec(dllexport)
 #  else
 #    define VF_CUDA_API __declspec(dllimport)

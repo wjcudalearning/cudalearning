@@ -17,14 +17,7 @@ import cv2
 import numpy as np
 import yaml
 
-def _find_repository_root() -> Path:
-    for candidate in Path(__file__).resolve().parents:
-        if (candidate / "core").is_dir():
-            return candidate
-    raise RuntimeError("Full validation requires the original AOI repository containing core/.")
-
-
-ROOT = _find_repository_root()
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -57,7 +50,7 @@ PRODUCTION_RECIPES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate visionflow_cuda.dll against the CPU AOI path.")
-    parser.add_argument("--dll", default="gpu/visionflow_cuda.dll", help="CUDA DLL path.")
+    parser.add_argument("--dll", default="build/visionflow_cuda/visionflow_cuda.dll", help="CUDA DLL path.")
     parser.add_argument("--image", help="Optional real image for full CPU/GPU pipeline comparison.")
     parser.add_argument("--recipe", help="Recipe used with --image.")
     parser.add_argument(
